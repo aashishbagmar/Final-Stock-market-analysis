@@ -1,0 +1,5 @@
+venv/
+__pycache__/
+*.pyc
+performance_metrics.py
+app_functions_explanation.md
