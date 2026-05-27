@@ -1,5 +1,11 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
+*.log
+.env
+.env.*
+.streamlit/secrets.toml
+.DS_Store
 performance_metrics.py
 app_functions_explanation.md

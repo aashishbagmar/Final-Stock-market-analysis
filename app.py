@@ -1,38 +1,29 @@
 """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║              AI STOCK ANALYST  —  STRICT LIVE SEQUENTIAL PIPELINE            ║
-║                                                                              ║
-║  WORKFLOW (triggered on every run, no caching of results):                   ║
-║  Step 1 → User enters ticker                                                 ║
-║  Step 2 → Fetch LIVE stock data (yfinance, up to today)                      ║
-║  Step 3 → Fetch LIVE news (NewsAPI, today's articles)                        ║
-║  Step 4 → Run BERT sentiment on live headlines                               ║
-║  Step 5 → Engineer features from live data                                   ║
-║  Step 6 → Train Linear Regression on live data  → predict                    ║
-║  Step 7 → Train Random Forest on live data      → predict                    ║
-║  Step 8 → Train LSTM on live data               → predict                    ║
-║  Step 9 → Ensemble all 3 predictions                                         ║
-║  Step 10 → Combine sentiment + ensemble → BUY / SELL / HOLD                  ║
-║                                                                              ║
-║  Run:  streamlit run app.py                                                  ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+AI Stock Analyst - Cloud-ready Streamlit app
+Production optimizations: caching, env vars, safe fallbacks, lightweight modes.
 """
 
-# ── Stdlib ─────────────────────────────────────────────────────────────────
-import warnings, logging, time
+# --- Stdlib ---
+import os
+import re
+import time
+import hashlib
+import logging
+import warnings
 from datetime import datetime
+from typing import Dict, List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 
-warnings.filterwarnings("ignore")
-os_env_set = __import__("os").environ
-os_env_set["TF_CPP_MIN_LOG_LEVEL"] = "3"
-logging.getLogger("transformers").setLevel(logging.ERROR)
-
-# ── Third-party ────────────────────────────────────────────────────────────
+# --- Third-party ---
 import numpy as np
 import pandas as pd
 import requests
-import yfinance as yf
 import streamlit as st
+import yfinance as yf
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
@@ -40,16 +31,56 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error
 
 import tensorflow as tf
-tf.get_logger().setLevel("ERROR")
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
 
-from transformers import pipeline as hf_pipeline
+try:
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline as hf_pipeline
+    _TRANSFORMERS_FULL = True
+except Exception:
+    from transformers import pipeline as hf_pipeline
+    AutoModelForSequenceClassification = None
+    AutoTokenizer = None
+    _TRANSFORMERS_FULL = False
+import torch
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE CONFIG  (must be first Streamlit call)
-# ══════════════════════════════════════════════════════════════════════════════
+try:
+    from dotenv import load_dotenv
+except Exception:
+    load_dotenv = None
+
+try:
+    from yfinance.exceptions import YFRateLimitError
+except Exception:
+    YFRateLimitError = None
+
+# --- Global env defaults ---
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+warnings.filterwarnings("ignore")
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
+
+if load_dotenv:
+    # Load local .env for development only; no override to keep real env vars priority.
+    load_dotenv(override=False)
+
+# --- Config ---
+DEFAULT_CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "900"))
+MAX_ARTICLES_DEFAULT = int(os.getenv("MAX_NEWS_ARTICLES", "12"))
+MAX_LSTM_EPOCHS = int(os.getenv("LSTM_MAX_EPOCHS", "10"))
+MODEL_WARMUP = os.getenv("MODEL_WARMUP", "true").lower() == "true"
+LIGHTWEIGHT_ENV = os.getenv("LIGHTWEIGHT_MODE", "").lower() in ("1", "true", "yes")
+DEBUG_FETCH_ENV = os.getenv("DEBUG_FETCH", "").lower() in ("1", "true", "yes")
+YF_MIN_INTERVAL = float(os.getenv("YF_MIN_INTERVAL", "1.2"))
+YF_MAX_RETRIES = int(os.getenv("YF_MAX_RETRIES", "3"))
+YF_TIMEOUT = int(os.getenv("YF_TIMEOUT", "10"))
+
+TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-^]{0,12}$")
+
+# --- Streamlit page config (must be first Streamlit call) ---
 st.set_page_config(
     page_title="AI Stock Analyst",
     page_icon="📡",
@@ -57,10 +88,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CSS  — Bloomberg-terminal meets brutalist design
-# ══════════════════════════════════════════════════════════════════════════════
-st.markdown("""
+# --- CSS (Bloomberg terminal + responsive tweaks) ---
+st.markdown(
+    """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;600;700&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
 
@@ -71,63 +101,15 @@ h1,h2,h3,h4, .mono { font-family: 'IBM Plex Mono', monospace !important; }
 .stApp { background: #080b10; color: #c9d1d9; }
 .main .block-container { padding-top: 1.5rem; max-width: 1300px; }
 
-/* ── HEADER ── */
-.app-header {
-    border-bottom: 1px solid #1c2333;
-    padding-bottom: 1.2rem;
-    margin-bottom: 1.5rem;
-}
-.app-title {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 1.9rem;
-    font-weight: 700;
-    color: #58a6ff;
-    letter-spacing: 3px;
-    text-transform: uppercase;
-}
-.app-sub {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.72rem;
-    color: #3d4f6e;
-    letter-spacing: 4px;
-    text-transform: uppercase;
-    margin-top: 2px;
-}
+.app-header { border-bottom: 1px solid #1c2333; padding-bottom: 1.2rem; margin-bottom: 1.5rem; }
+.app-title { font-family: 'IBM Plex Mono', monospace; font-size: 1.9rem; font-weight: 700; color: #58a6ff; letter-spacing: 3px; text-transform: uppercase; }
+.app-sub { font-family: 'IBM Plex Mono', monospace; font-size: 0.72rem; color: #3d4f6e; letter-spacing: 4px; text-transform: uppercase; margin-top: 2px; }
 
-/* ── WORKFLOW STEPS ── */
-.step-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 16px;
-    border-radius: 6px;
-    margin: 5px 0;
-    background: #0d1117;
-    border: 1px solid #1c2333;
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.82rem;
-    transition: all 0.3s;
-}
-.step-row.active {
-    background: #0d1e33;
-    border-color: #1f6feb;
-    color: #58a6ff;
-}
-.step-row.done {
-    background: #0d1f17;
-    border-color: #196c3b;
-    color: #3fb950;
-}
-.step-row.error {
-    background: #1f0d0d;
-    border-color: #6e1313;
-    color: #f85149;
-}
-.step-dot {
-    width: 10px; height: 10px;
-    border-radius: 50%;
-    flex-shrink: 0;
-}
+.step-row { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-radius: 6px; margin: 5px 0; background: #0d1117; border: 1px solid #1c2333; font-family: 'IBM Plex Mono', monospace; font-size: 0.82rem; transition: all 0.3s; }
+.step-row.active { background: #0d1e33; border-color: #1f6feb; color: #58a6ff; }
+.step-row.done { background: #0d1f17; border-color: #196c3b; color: #3fb950; }
+.step-row.error { background: #1f0d0d; border-color: #6e1313; color: #f85149; }
+.step-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
 .dot-wait  { background: #3d4f6e; }
 .dot-active{ background: #1f6feb; box-shadow: 0 0 8px #1f6feb; animation: blink 1s infinite; }
 .dot-done  { background: #3fb950; }
@@ -135,13 +117,7 @@ h1,h2,h3,h4, .mono { font-family: 'IBM Plex Mono', monospace !important; }
 
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
 
-/* ── SIGNAL ── */
-.signal-box {
-    border-radius: 10px;
-    padding: 32px 20px;
-    text-align: center;
-    font-family: 'IBM Plex Mono', monospace;
-}
+.signal-box { border-radius: 10px; padding: 32px 20px; text-align: center; font-family: 'IBM Plex Mono', monospace; }
 .signal-BUY  { background:#051a0f; border:2px solid #3fb950; }
 .signal-SELL { background:#1a0505; border:2px solid #f85149; }
 .signal-HOLD { background:#111108; border:2px solid #d29922; }
@@ -150,115 +126,46 @@ h1,h2,h3,h4, .mono { font-family: 'IBM Plex Mono', monospace !important; }
 .signal-word-HOLD { font-size:3.6rem; font-weight:700; color:#d29922; letter-spacing:10px; }
 .signal-reason { color:#8b949e; margin-top:10px; font-size:0.85rem; }
 
-/* ── METRIC CARDS ── */
 .metric-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; margin:12px 0; }
-.mcard {
-    background:#0d1117;
-    border:1px solid #1c2333;
-    border-radius:8px;
-    padding:14px 16px;
-}
+.mcard { background:#0d1117; border:1px solid #1c2333; border-radius:8px; padding:14px 16px; }
 .mcard-label { font-size:0.68rem; color:#3d4f6e; letter-spacing:2px; text-transform:uppercase; font-family:'IBM Plex Mono',monospace; }
 .mcard-value { font-size:1.25rem; font-weight:600; color:#e6edf3; font-family:'IBM Plex Mono',monospace; margin-top:4px; }
 .mcard-sub   { font-size:0.72rem; color:#8b949e; margin-top:2px; }
 
-/* ── NEWS ── */
-.news-item {
-    border-left: 3px solid #1c2333;
-    padding: 8px 14px;
-    margin: 6px 0;
-    font-size: 0.83rem;
-    background: #0d1117;
-    border-radius: 0 6px 6px 0;
-}
+.news-item { border-left: 3px solid #1c2333; padding: 8px 14px; margin: 6px 0; font-size: 0.83rem; background: #0d1117; border-radius: 0 6px 6px 0; }
 .news-pos { border-left-color: #3fb950; }
 .news-neg { border-left-color: #f85149; }
 .news-neu { border-left-color: #d29922; }
 
-/* ── MODEL TABLE ── */
-.model-row {
-    display:grid;
-    grid-template-columns: 160px 1fr 1fr 1fr;
-    gap:8px;
-    padding:10px 14px;
-    border-radius:6px;
-    margin:4px 0;
-    background:#0d1117;
-    border:1px solid #1c2333;
-    font-family:'IBM Plex Mono',monospace;
-    font-size:0.82rem;
-    align-items:center;
-}
+.model-row { display:grid; grid-template-columns: 160px 1fr 1fr 1fr; gap:8px; padding:10px 14px; border-radius:6px; margin:4px 0; background:#0d1117; border:1px solid #1c2333; font-family:'IBM Plex Mono',monospace; font-size:0.82rem; align-items:center; }
 .model-row.header { color:#3d4f6e; font-size:0.7rem; letter-spacing:2px; background:transparent; border-color:transparent; }
 
-/* ── CONFIDENCE BAR ── */
 .conf-bar-wrap { background:#1c2333; border-radius:4px; height:10px; overflow:hidden; margin-top:6px; }
 .conf-bar-fill { height:100%; border-radius:4px; background:linear-gradient(90deg,#1f6feb,#58a6ff); }
 
-/* ── SENTIMENT BAR ── */
 .sent-bar-wrap { display:flex; height:14px; border-radius:6px; overflow:hidden; margin:8px 0; }
 
-/* ── LIVE BADGE ── */
-.live-badge {
-    display:inline-block;
-    background:#1a1f2e;
-    border:1px solid #1f6feb;
-    color:#58a6ff;
-    font-family:'IBM Plex Mono',monospace;
-    font-size:0.65rem;
-    letter-spacing:3px;
-    padding:2px 10px;
-    border-radius:20px;
-}
-.live-dot {
-    display:inline-block;
-    width:6px;height:6px;
-    border-radius:50%;
-    background:#3fb950;
-    margin-right:5px;
-    animation:blink 1.4s infinite;
-    vertical-align:middle;
-}
+.live-badge { display:inline-block; background:#1a1f2e; border:1px solid #1f6feb; color:#58a6ff; font-family:'IBM Plex Mono',monospace; font-size:0.65rem; letter-spacing:3px; padding:2px 10px; border-radius:20px; }
+.live-dot { display:inline-block; width:6px;height:6px; border-radius:50%; background:#3fb950; margin-right:5px; animation:blink 1.4s infinite; vertical-align:middle; }
 
-/* ── STREAMLIT OVERRIDES ── */
-.stButton > button {
-    background: #1f6feb;
-    color: #ffffff;
-    border: none;
-    border-radius: 6px;
-    font-family: 'IBM Plex Mono', monospace;
-    font-weight: 600;
-    letter-spacing: 2px;
-    padding: 0.55rem 1.8rem;
-    width: 100%;
-    transition: background 0.2s;
-}
+.stButton > button { background: #1f6feb; color: #ffffff; border: none; border-radius: 6px; font-family: 'IBM Plex Mono', monospace; font-weight: 600; letter-spacing: 2px; padding: 0.55rem 1.8rem; width: 100%; transition: background 0.2s; }
 .stButton > button:hover { background: #388bfd; }
-.stTextInput > div > div > input {
-    background: #0d1117;
-    border: 1px solid #1c2333;
-    border-radius: 6px;
-    color: #e6edf3;
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 1rem;
-}
-div[data-testid="metric-container"] {
-    background: #0d1117;
-    border: 1px solid #1c2333;
-    border-radius: 8px;
-    padding: 12px;
-}
-.stSidebar { background: #0d1117; }
-.stExpander { background: #0d1117; border: 1px solid #1c2333; border-radius:8px; }
+.stTextInput > div > div > input { background: #0d1117; border: 1px solid #1c2333; border-radius: 6px; color: #e6edf3; font-family: 'IBM Plex Mono', monospace; font-size: 1rem; }
 section[data-testid="stSidebar"] { background: #0d1117; }
+
+@media (max-width: 900px) {
+    .app-title { font-size: 1.4rem; letter-spacing: 2px; }
+    .app-sub { font-size: 0.6rem; letter-spacing: 2px; }
+    .model-row { grid-template-columns: 1fr; gap: 6px; }
+    .signal-word-BUY, .signal-word-SELL, .signal-word-HOLD { font-size: 2.6rem; letter-spacing: 6px; }
+    .main .block-container { padding: 1rem 0.8rem; }
+}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP TRACKER  — renders the live pipeline progress in the sidebar
-# ══════════════════════════════════════════════════════════════════════════════
-
+# --- Pipeline steps ---
 STEPS = [
     ("01", "User Input"),
     ("02", "Fetch Live Stock Data"),
@@ -272,410 +179,858 @@ STEPS = [
     ("10", "Generate Signal"),
 ]
 
-def render_pipeline(states: dict, placeholder):
-    """Render the step pipeline into a given sidebar placeholder."""
-    html = "<div style='margin-top:8px;'>"
-    for idx, (num, label) in enumerate(STEPS):
-        state = states.get(idx, "wait")
-        dot_cls  = {"wait":"dot-wait","active":"dot-active","done":"dot-done","error":"dot-error"}[state]
-        row_cls  = {"wait":"","active":" active","done":" done","error":" error"}[state]
-        icon     = {"wait":"○","active":"◉","done":"✓","error":"✗"}[state]
-        html += f"""
-        <div class='step-row{row_cls}'>
-            <span class='step-dot {dot_cls}'></span>
-            <span style='color:#3d4f6e;'>STEP {num}</span>
-            <span style='flex:1'>{label}</span>
-            <span>{icon}</span>
-        </div>"""
-    html += "</div>"
-    placeholder.markdown(html, unsafe_allow_html=True)
+
+def is_cloud_env() -> bool:
+    return any(
+        os.getenv(name)
+        for name in ("RENDER", "RAILWAY_ENVIRONMENT", "STREAMLIT_SERVER_HEADLESS")
+    )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PIPELINE FUNCTIONS  (all operate on fresh live data, no result caching)
-# ══════════════════════════════════════════════════════════════════════════════
+def get_secret(key: str) -> str:
+    val = os.getenv(key)
+    if val:
+        return val
+    try:
+        return st.secrets.get(key, "")
+    except Exception:
+        return ""
 
-# ── STEP 2: Live Stock Data ────────────────────────────────────────────────
-def fetch_live_stock(ticker: str) -> tuple[pd.DataFrame, dict]:
-    """
-    Download up-to-today OHLCV via yfinance.
-    Returns (dataframe, info_dict). Raises ValueError on failure.
-    """
-    df = yf.download(ticker, period="2y", progress=False, auto_adjust=True)
-    if df.empty:
-        raise ValueError(f"No price data found for '{ticker}'. Check the ticker symbol.")
+
+def sanitize_ticker(raw: str) -> str:
+    value = (raw or "").strip().upper()
+    if not value:
+        return ""
+    if not TICKER_RE.match(value):
+        return ""
+    return value
+
+
+def build_ticker_candidates(ticker: str) -> List[str]:
+    cleaned = ticker.strip().upper().replace(" ", "")
+    candidates = [cleaned]
+
+    if cleaned.endswith(".NS"):
+        candidates.append(cleaned.replace(".NS", ".BO"))
+        candidates.append(cleaned.replace(".NS", ""))
+    elif cleaned.endswith(".BO"):
+        candidates.append(cleaned.replace(".BO", ".NS"))
+        candidates.append(cleaned.replace(".BO", ""))
+    else:
+        if not cleaned.startswith("^"):
+            candidates.append(f"{cleaned}.NS")
+            candidates.append(f"{cleaned}.BO")
+
+    # Add a lowercase version as a final fallback for Yahoo quirks.
+    candidates.append(cleaned.lower())
+
+    # Deduplicate while preserving order.
+    seen = set()
+    ordered = []
+    for c in candidates:
+        if c and c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    return ordered
+
+
+class RateLimiter:
+    def __init__(self, min_interval: float) -> None:
+        self.min_interval = min_interval
+        self._lock = Lock()
+        self._last_call = 0.0
+
+    def wait(self) -> float:
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_call
+            remaining = self.min_interval - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+            self._last_call = time.monotonic()
+            return max(0.0, remaining)
+
+
+@st.cache_resource(show_spinner=False)
+def get_rate_limiter() -> RateLimiter:
+    return RateLimiter(YF_MIN_INTERVAL)
+
+
+def is_rate_limit_error(err: Exception) -> bool:
+    if YFRateLimitError and isinstance(err, YFRateLimitError):
+        return True
+    msg = str(err).lower()
+    return "rate limit" in msg or "too many requests" in msg or "429" in msg
+
+
+def backoff_delay(attempt: int) -> float:
+    base = 0.8 * (2 ** (attempt - 1))
+    jitter = 0.2 * np.random.random()
+    return base + jitter
+
+
+def validate_ohlcv(df: pd.DataFrame, min_rows: int = 30) -> Tuple[bool, pd.DataFrame, str]:
+    if df is None or df.empty:
+        return False, df, "empty"
     if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
         df.columns = df.columns.get_level_values(0)
-    df = df[["Open","High","Low","Close","Volume"]].dropna()
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    if not set(required).issubset(df.columns):
+        return False, df, "missing_ohlcv"
+    df = df[required]
+    if df.dropna(how="all").empty:
+        return False, df, "all_nan"
+    if df["Close"].dropna().empty:
+        return False, df, "no_close"
+    if len(df) < min_rows:
+        return False, df, "not_enough_rows"
+    return True, df.dropna(), "ok"
+
+
+def log_fetch_event(event: str, details: Dict, logs: List[Dict]) -> None:
+    logger = logging.getLogger("stock_fetch")
+    payload = {"event": event, **details}
+    logger.info("stock_fetch %s", payload)
+    logs.append(payload)
+
+
+@st.cache_data(ttl=DEFAULT_CACHE_TTL, show_spinner=False)
+def get_ticker_info_cached(ticker: str) -> Dict:
+    session = get_yf_session()
+    t = yf.Ticker(ticker, session=session)
+    info: Dict[str, object] = {}
 
     try:
-        raw = yf.Ticker(ticker).info
-        info = {
-            "name":       raw.get("longName") or raw.get("shortName") or ticker,
-            "currency":   raw.get("currency", "USD"),
-            "exchange":   raw.get("exchange", ""),
-            "sector":     raw.get("sector", "N/A"),
-            "market_cap": raw.get("marketCap", 0),
-        }
+        fast = getattr(t, "fast_info", None)
+        if fast:
+            info = {
+                "name": fast.get("shortName") or fast.get("longName") or ticker,
+                "currency": fast.get("currency", "USD"),
+                "exchange": fast.get("exchange", ""),
+                "sector": "N/A",
+                "market_cap": fast.get("marketCap", 0),
+            }
     except Exception:
+        info = {}
+
+    if not info:
+        try:
+            raw = t.info
+            info = {
+                "name": raw.get("longName") or raw.get("shortName") or ticker,
+                "currency": raw.get("currency", "USD"),
+                "exchange": raw.get("exchange", ""),
+                "sector": raw.get("sector", "N/A"),
+                "market_cap": raw.get("marketCap", 0),
+            }
+        except Exception:
+            info = {}
+
+    if not info:
         info = {"name": ticker, "currency": "USD", "exchange": "", "sector": "N/A", "market_cap": 0}
+    return info
 
-    return df, info
+
+def data_signature(df: pd.DataFrame) -> str:
+    tail = df.tail(120)
+    payload = pd.util.hash_pandas_object(tail, index=True).values.tobytes()
+    return hashlib.sha256(payload).hexdigest()
 
 
-# ── STEP 3: Live News ──────────────────────────────────────────────────────
-def fetch_live_news(ticker: str, company: str, api_key: str, n: int = 15) -> list[dict]:
-    """
-    Fetch today/recent news from NewsAPI.
-    Query uses company name first; falls back to ticker root.
-    """
-    query = company if company and company != ticker else ticker.replace(".NS","").replace(".BO","")
-    url = (
-        "https://newsapi.org/v2/everything"
-        f"?q={requests.utils.quote(query)}"
-        "&sortBy=publishedAt&language=en"
-        f"&pageSize={n}&apiKey={api_key}"
+@st.cache_resource(show_spinner=False)
+def get_requests_session() -> requests.Session:
+    session = requests.Session()
+    retries = Retry(
+        total=2,
+        backoff_factor=0.4,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
     )
-    resp = requests.get(url, timeout=12)
-    if resp.status_code != 200:
-        raise ConnectionError(f"NewsAPI error {resp.status_code}: {resp.json().get('message','')}")
-    articles = resp.json().get("articles", [])
-    return [
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+@st.cache_resource(show_spinner=False)
+def get_yf_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(
         {
-            "title":     a["title"],
-            "desc":      a.get("description") or "",
-            "url":       a.get("url",""),
-            "date":      (a.get("publishedAt") or "")[:10],
-            "source":    a.get("source",{}).get("name",""),
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
-        for a in articles if a.get("title")
-    ]
+    )
+    retries = Retry(
+        total=2,
+        backoff_factor=0.3,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
-# ── STEP 4: BERT Sentiment ─────────────────────────────────────────────────
-@st.cache_resource(show_spinner=False)   # model weights cached once; inference always live
-def _load_bert():
+@st.cache_resource(show_spinner=False)
+def load_bert_pipeline():
+    if _TRANSFORMERS_FULL and AutoTokenizer and AutoModelForSequenceClassification:
+        tokenizer = AutoTokenizer.from_pretrained("nlptown/bert-base-multilingual-uncased-sentiment")
+        model = AutoModelForSequenceClassification.from_pretrained(
+            "nlptown/bert-base-multilingual-uncased-sentiment",
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
+        )
+        torch.set_num_threads(1)
+        return hf_pipeline("text-classification", model=model, tokenizer=tokenizer, device=-1, top_k=1)
+
+    # Fallback for older/partial transformers installs
     return hf_pipeline(
         "text-classification",
         model="nlptown/bert-base-multilingual-uncased-sentiment",
         top_k=1,
     )
 
-def run_bert_sentiment(articles: list[dict]) -> dict:
-    """
-    Classify each article with BERT.
-    Stars 1-2 → negative, 3 → neutral, 4-5 → positive.
-    """
-    model = _load_bert()
-    scored = []
-    for art in articles:
-        text = (art["title"] + ". " + art["desc"])[:512]
+
+def warmup_models():
+    if not MODEL_WARMUP:
+        return
+    if st.session_state.get("warmup_started"):
+        return
+    st.session_state["warmup_started"] = True
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    st.session_state["warmup_future"] = executor.submit(load_bert_pipeline)
+
+
+@st.cache_data(ttl=DEFAULT_CACHE_TTL, show_spinner=False)
+def fetch_live_stock_cached(ticker: str) -> Tuple[pd.DataFrame, Dict]:
+    return fetch_live_stock_uncached(ticker)
+
+
+def fetch_live_stock_uncached(ticker: str) -> Tuple[pd.DataFrame, Dict]:
+    # Robust yfinance fetch with retries, fallbacks, and validation.
+    logs: List[Dict] = []
+    st.session_state["fetch_logs"] = logs
+    st.session_state["using_cached_data"] = False
+    st.session_state["rate_limited"] = False
+
+    session = get_yf_session()
+    limiter = get_rate_limiter()
+
+    candidates = build_ticker_candidates(ticker)
+    log_fetch_event("candidate_tickers", {"input": ticker, "candidates": candidates}, logs)
+
+    download_plans = [
+        {"period": "2y", "interval": "1d"},
+        {"period": "1y", "interval": "1d"},
+        {"period": "6mo", "interval": "1d"},
+    ]
+
+    max_retries = max(2, min(YF_MAX_RETRIES, 3))
+    timeout = YF_TIMEOUT
+
+    ok = False
+    last_error = ""
+    for cand in candidates:
+        for attempt in range(1, max_retries + 1):
+            log_fetch_event("download_attempt", {"ticker": cand, "attempt": attempt}, logs)
+
+            for plan in download_plans:
+                try:
+                    limiter.wait()
+                    df = yf.download(
+                        cand,
+                        progress=False,
+                        auto_adjust=False,
+                        group_by="column",
+                        threads=False,
+                        timeout=timeout,
+                        session=session,
+                        **plan,
+                    )
+                except Exception as e:
+                    last_error = str(e)
+                    if is_rate_limit_error(e):
+                        st.session_state["rate_limited"] = True
+                    log_fetch_event(
+                        "download_error",
+                        {"ticker": cand, "plan": plan, "error": last_error},
+                        logs,
+                    )
+                    df = pd.DataFrame()
+
+                ok, cleaned, reason = validate_ohlcv(df)
+                log_fetch_event(
+                    "download_validate",
+                    {
+                        "ticker": cand,
+                        "plan": plan,
+                        "rows": len(df) if df is not None else 0,
+                        "columns": list(df.columns) if df is not None else [],
+                        "status": reason,
+                    },
+                    logs,
+                )
+                if ok:
+                    df = cleaned
+                    break
+
+            if ok:
+                break
+
+            try:
+                limiter.wait()
+                history = yf.Ticker(cand, session=session).history(
+                    period="1y",
+                    interval="1d",
+                    auto_adjust=False,
+                    actions=False,
+                    repair=True,
+                    timeout=timeout,
+                )
+            except TypeError:
+                history = yf.Ticker(cand, session=session).history(
+                    period="1y",
+                    interval="1d",
+                    auto_adjust=False,
+                    actions=False,
+                    repair=True,
+                )
+            except Exception as e:
+                last_error = str(e)
+                if is_rate_limit_error(e):
+                    st.session_state["rate_limited"] = True
+                history = pd.DataFrame()
+                log_fetch_event(
+                    "history_error",
+                    {"ticker": cand, "error": last_error},
+                    logs,
+                )
+
+            ok, cleaned, reason = validate_ohlcv(history)
+            log_fetch_event(
+                "history_validate",
+                {
+                    "ticker": cand,
+                    "rows": len(history) if history is not None else 0,
+                    "columns": list(history.columns) if history is not None else [],
+                    "status": reason,
+                },
+                logs,
+            )
+            if ok:
+                df = cleaned
+                break
+
+            delay = backoff_delay(attempt)
+            log_fetch_event("backoff", {"attempt": attempt, "sleep": round(delay, 2)}, logs)
+            time.sleep(delay)
+
+        if ok:
+            ticker = cand
+            break
+
+    if not ok:
+        cached = st.session_state.get("last_good_data", {}).get(ticker)
+        if cached is not None:
+            st.session_state["using_cached_data"] = True
+            log_fetch_event("fallback_cached", {"ticker": ticker}, logs)
+            return cached
+        hint = f" Last error: {last_error}" if last_error else ""
+        raise ValueError(f"No price data found for '{ticker}'. Check the ticker symbol or network.{hint}")
+
+    info = get_ticker_info_cached(ticker)
+    st.session_state.setdefault("last_good_data", {})[ticker] = (df, info)
+    return df, info
+
+
+@st.cache_data(ttl=DEFAULT_CACHE_TTL, show_spinner=False)
+def fetch_live_news_cached(query: str, api_key: str, n: int) -> List[Dict]:
+    return fetch_live_news_uncached(query, api_key, n)
+
+
+def fetch_live_news_uncached(query: str, api_key: str, n: int) -> List[Dict]:
+    session = get_requests_session()
+    url = (
+        "https://newsapi.org/v2/everything"
+        f"?q={requests.utils.quote(query)}"
+        "&sortBy=publishedAt&language=en"
+        f"&pageSize={n}&apiKey={api_key}"
+    )
+    resp = session.get(url, timeout=12)
+    if resp.status_code == 429:
+        raise ConnectionError("NewsAPI rate limit reached. Try again later.")
+    if resp.status_code != 200:
         try:
-            out       = model(text)[0][0]
-            stars     = int(out["label"][0])
+            msg = resp.json().get("message", "")
+        except Exception:
+            msg = ""
+        raise ConnectionError(f"NewsAPI error {resp.status_code}. {msg}")
+    articles = resp.json().get("articles", [])
+    return [
+        {
+            "title": a.get("title", ""),
+            "desc": a.get("description") or "",
+            "url": a.get("url", ""),
+            "date": (a.get("publishedAt") or "")[:10],
+            "source": a.get("source", {}).get("name", ""),
+        }
+        for a in articles
+        if a.get("title")
+    ]
+
+
+@st.cache_data(ttl=DEFAULT_CACHE_TTL, show_spinner=False)
+def engineer_features_cached(df: pd.DataFrame, sig: str) -> pd.DataFrame:
+    return engineer_features_uncached(df)
+
+
+def engineer_features_uncached(df: pd.DataFrame) -> pd.DataFrame:
+    d = df[["Close"]].copy()
+    d["MA7"] = d["Close"].rolling(7).mean()
+    d["MA21"] = d["Close"].rolling(21).mean()
+    d["MA50"] = d["Close"].rolling(50).mean()
+    d["Std7"] = d["Close"].rolling(7).std()
+    d["Pct1"] = d["Close"].pct_change(1)
+    d["Pct5"] = d["Close"].pct_change(5)
+    d["Pct20"] = d["Close"].pct_change(20)
+    delta = d["Close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    d["RSI"] = 100 - 100 / (1 + gain / (loss + 1e-9))
+    return d.dropna()
+
+
+@st.cache_data(ttl=DEFAULT_CACHE_TTL, show_spinner=False)
+def train_linear_regression_cached(feat: pd.DataFrame, horizon: int, sig: str) -> Dict:
+    return train_linear_regression_uncached(feat, horizon)
+
+
+def train_linear_regression_uncached(feat: pd.DataFrame, horizon: int) -> Dict:
+    X = feat.copy()
+    y = X["Close"].shift(-horizon).dropna()
+    X = X.iloc[: len(y)]
+
+    split = int(len(X) * 0.85)
+    scaler = MinMaxScaler()
+    Xtr = scaler.fit_transform(X.iloc[:split])
+    ytr = y.iloc[:split]
+    Xte = scaler.transform(X.iloc[split:])
+    yte = y.iloc[split:]
+
+    model = LinearRegression().fit(Xtr, ytr)
+    mae = round(mean_absolute_error(yte, model.predict(Xte)), 4)
+    pred = float(model.predict(scaler.transform(feat.iloc[[-1]]))[0])
+    return {"model": "Linear Regression", "predicted": round(pred, 2), "mae": mae}
+
+
+@st.cache_data(ttl=DEFAULT_CACHE_TTL, show_spinner=False)
+def train_random_forest_cached(feat: pd.DataFrame, horizon: int, sig: str) -> Dict:
+    return train_random_forest_uncached(feat, horizon)
+
+
+def train_random_forest_uncached(feat: pd.DataFrame, horizon: int) -> Dict:
+    X = feat.copy()
+    y = X["Close"].shift(-horizon).dropna()
+    X = X.iloc[: len(y)]
+
+    split = int(len(X) * 0.85)
+    scaler = MinMaxScaler()
+    Xtr = scaler.fit_transform(X.iloc[:split])
+    ytr = y.iloc[:split]
+    Xte = scaler.transform(X.iloc[split:])
+    yte = y.iloc[split:]
+
+    model = RandomForestRegressor(
+        n_estimators=160,
+        max_depth=8,
+        random_state=42,
+        n_jobs=-1,
+    )
+    model.fit(Xtr, ytr)
+    mae = round(mean_absolute_error(yte, model.predict(Xte)), 4)
+    pred = float(model.predict(scaler.transform(feat.iloc[[-1]]))[0])
+    return {"model": "Random Forest", "predicted": round(pred, 2), "mae": mae}
+
+
+def configure_tensorflow(lightweight: bool) -> None:
+    try:
+        tf.get_logger().setLevel("ERROR")
+        if lightweight:
+            tf.config.threading.set_intra_op_parallelism_threads(1)
+            tf.config.threading.set_inter_op_parallelism_threads(1)
+    except Exception:
+        pass
+
+
+@st.cache_data(ttl=DEFAULT_CACHE_TTL, show_spinner=False)
+def train_lstm_cached(
+    df: pd.DataFrame,
+    horizon: int,
+    epochs: int,
+    lightweight: bool,
+    sig: str,
+) -> Dict:
+    return train_lstm_uncached(df, horizon, epochs, lightweight)
+
+
+def train_lstm_uncached(df: pd.DataFrame, horizon: int, epochs: int, lightweight: bool) -> Dict:
+    configure_tensorflow(lightweight)
+    tf.keras.backend.clear_session()
+
+    prices = df["Close"].values.astype(np.float32)
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(prices.reshape(-1, 1)).flatten()
+
+    look_back = 20 if lightweight else 30
+    look_back = min(look_back, max(10, len(scaled) // 10))
+
+    xs, ys = [], []
+    for i in range(look_back, len(scaled) - horizon):
+        xs.append(scaled[i - look_back : i])
+        ys.append(scaled[i + horizon - 1])
+    if not xs:
+        raise ValueError("Not enough data for LSTM training.")
+
+    xs = np.array(xs).reshape(-1, look_back, 1)
+    ys = np.array(ys)
+
+    split = int(len(xs) * 0.85)
+    xtr, xte = xs[:split], xs[split:]
+    ytr, yte = ys[:split], ys[split:]
+
+    units_1 = 32 if lightweight else 48
+    units_2 = 16 if lightweight else 24
+    batch_size = 16 if lightweight else 32
+    epochs = max(3, min(epochs, MAX_LSTM_EPOCHS))
+
+    model = Sequential(
+        [
+            LSTM(units_1, return_sequences=True, input_shape=(look_back, 1)),
+            Dropout(0.2),
+            LSTM(units_2),
+            Dropout(0.2),
+            Dense(16, activation="relu"),
+            Dense(1),
+        ]
+    )
+    model.compile(optimizer="adam", loss="huber")
+
+    es = EarlyStopping(monitor="val_loss", patience=2, restore_best_weights=True, verbose=0)
+    model.fit(
+        xtr,
+        ytr,
+        validation_split=0.1,
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=[es],
+        verbose=0,
+    )
+
+    test_pred = scaler.inverse_transform(model.predict(xte, verbose=0))
+    test_true = scaler.inverse_transform(yte.reshape(-1, 1))
+    mae = round(float(mean_absolute_error(test_true, test_pred)), 4)
+
+    seq = scaled[-look_back:].copy()
+    for _ in range(horizon):
+        inp = seq[-look_back:].reshape(1, look_back, 1)
+        nxt = model.predict(inp, verbose=0)[0][0]
+        seq = np.append(seq, nxt)
+    pred = float(scaler.inverse_transform([[seq[-1]]])[0][0])
+
+    tf.keras.backend.clear_session()
+    return {"model": "LSTM", "predicted": round(pred, 2), "mae": mae}
+
+
+def run_bert_sentiment(articles: List[Dict]) -> Dict:
+    if not articles:
+        return {
+            "articles": [],
+            "counts": {"positive": 0, "neutral": 1, "negative": 0},
+            "pct_pos": 0,
+            "pct_neu": 100,
+            "pct_neg": 0,
+            "score": 0.5,
+            "overall": "Neutral",
+        }
+
+    try:
+        model = load_bert_pipeline()
+    except Exception:
+        return {
+            "articles": [],
+            "counts": {"positive": 0, "neutral": 1, "negative": 0},
+            "pct_pos": 0,
+            "pct_neu": 100,
+            "pct_neg": 0,
+            "score": 0.5,
+            "overall": "Neutral",
+        }
+    texts = [(a["title"] + ". " + a["desc"])[:512] for a in articles]
+
+    scored = []
+    try:
+        outputs = model(texts, batch_size=8, truncation=True)
+    except Exception:
+        outputs = [[{"label": "3 stars", "score": 0.5}] for _ in texts]
+
+    for art, out in zip(articles, outputs):
+        try:
+            best = out[0]
+            stars = int(str(best["label"])[0])
             sentiment = "positive" if stars >= 4 else ("neutral" if stars == 3 else "negative")
-            conf      = round(out["score"], 4)
+            conf = round(float(best["score"]), 4)
         except Exception:
             sentiment, conf = "neutral", 0.5
         scored.append({**art, "sentiment": sentiment, "confidence": conf})
 
     total = len(scored) or 1
-    cnts  = {k: sum(1 for s in scored if s["sentiment"]==k) for k in ("positive","neutral","negative")}
-    score = (cnts["positive"] * 1.0 + cnts["neutral"] * 0.5) / total   # 0–1
+    cnts = {k: sum(1 for s in scored if s["sentiment"] == k) for k in ("positive", "neutral", "negative")}
+    score = (cnts["positive"] * 1.0 + cnts["neutral"] * 0.5) / total
 
     return {
-        "articles":        scored,
-        "counts":          cnts,
-        "pct_pos":         round(cnts["positive"] / total * 100, 1),
-        "pct_neu":         round(cnts["neutral"]  / total * 100, 1),
-        "pct_neg":         round(cnts["negative"] / total * 100, 1),
-        "score":           round(score, 4),
-        "overall":         "Positive" if score > 0.6 else ("Negative" if score < 0.4 else "Neutral"),
+        "articles": scored,
+        "counts": cnts,
+        "pct_pos": round(cnts["positive"] / total * 100, 1),
+        "pct_neu": round(cnts["neutral"] / total * 100, 1),
+        "pct_neg": round(cnts["negative"] / total * 100, 1),
+        "score": round(score, 4),
+        "overall": "Positive" if score > 0.6 else ("Negative" if score < 0.4 else "Neutral"),
     }
 
 
-# ── STEP 5: Feature Engineering ───────────────────────────────────────────
-def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Derive technical indicators from live OHLCV; drop NaN rows."""
-    d = df[["Close"]].copy()
-    d["MA7"]   = d["Close"].rolling(7).mean()
-    d["MA21"]  = d["Close"].rolling(21).mean()
-    d["MA50"]  = d["Close"].rolling(50).mean()
-    d["Std7"]  = d["Close"].rolling(7).std()
-    d["Pct1"]  = d["Close"].pct_change(1)
-    d["Pct5"]  = d["Close"].pct_change(5)
-    d["Pct20"] = d["Close"].pct_change(20)
-    delta = d["Close"].diff()
-    gain  = delta.clip(lower=0).rolling(14).mean()
-    loss  = (-delta.clip(upper=0)).rolling(14).mean()
-    d["RSI"]   = 100 - 100 / (1 + gain / (loss + 1e-9))
-    return d.dropna()
+def ensemble(lr: Dict, rf: Dict, lstm: Dict, current: float) -> Dict:
+    def inv(x):
+        return 1.0 / (x + 1e-6)
 
-
-# ── STEP 6: Linear Regression ─────────────────────────────────────────────
-def train_linear_regression(feat: pd.DataFrame, horizon: int) -> dict:
-    """Train LR on live feature set; return future price + MAE."""
-    X = feat.copy()
-    y = X["Close"].shift(-horizon).dropna()
-    X = X.iloc[:len(y)]
-
-    split = int(len(X) * 0.85)
-    scaler = MinMaxScaler()
-    Xtr = scaler.fit_transform(X.iloc[:split]);  ytr = y.iloc[:split]
-    Xte = scaler.transform(X.iloc[split:]);       yte = y.iloc[split:]
-
-    model = LinearRegression().fit(Xtr, ytr)
-    mae   = round(mean_absolute_error(yte, model.predict(Xte)), 4)
-    pred  = float(model.predict(scaler.transform(feat.iloc[[-1]]))[0])
-    return {"model": "Linear Regression", "predicted": round(pred, 2), "mae": mae}
-
-
-# ── STEP 7: Random Forest ─────────────────────────────────────────────────
-def train_random_forest(feat: pd.DataFrame, horizon: int) -> dict:
-    """Train RF on live feature set; return future price + MAE."""
-    X = feat.copy()
-    y = X["Close"].shift(-horizon).dropna()
-    X = X.iloc[:len(y)]
-
-    split = int(len(X) * 0.85)
-    scaler = MinMaxScaler()
-    Xtr = scaler.fit_transform(X.iloc[:split]);  ytr = y.iloc[:split]
-    Xte = scaler.transform(X.iloc[split:]);       yte = y.iloc[split:]
-
-    model = RandomForestRegressor(n_estimators=200, max_depth=8, random_state=42, n_jobs=-1)
-    model.fit(Xtr, ytr)
-    mae  = round(mean_absolute_error(yte, model.predict(Xte)), 4)
-    pred = float(model.predict(scaler.transform(feat.iloc[[-1]]))[0])
-    return {"model": "Random Forest", "predicted": round(pred, 2), "mae": mae}
-
-
-# ── STEP 8: LSTM ──────────────────────────────────────────────────────────
-def train_lstm(df: pd.DataFrame, horizon: int, epochs: int = 8) -> dict:
-    """
-    Train a 2-layer LSTM on live closing prices.
-    Uses iterative multi-step prediction for horizon days.
-    """
-    prices = df["Close"].values.astype(float)
-    scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(prices.reshape(-1, 1)).flatten()
-
-    LOOK_BACK = 30
-    # Build sequences
-    Xs, ys = [], []
-    for i in range(LOOK_BACK, len(scaled) - horizon):
-        Xs.append(scaled[i - LOOK_BACK:i])
-        ys.append(scaled[i + horizon - 1])   # predict price `horizon` steps ahead
-    Xs = np.array(Xs).reshape(-1, LOOK_BACK, 1)
-    ys = np.array(ys)
-
-    split = int(len(Xs) * 0.85)
-    Xtr, Xte = Xs[:split], Xs[split:]
-    ytr, yte  = ys[:split], ys[split:]
-
-    model = Sequential([
-        LSTM(48, return_sequences=True, input_shape=(LOOK_BACK, 1)),
-        Dropout(0.2),
-        LSTM(24),
-        Dropout(0.2),
-        Dense(16, activation="relu"),
-        Dense(1),
-    ])
-    model.compile(optimizer="adam", loss="huber")  # Huber = robust to outliers
-
-    es = EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True, verbose=0)
-    model.fit(
-        Xtr, ytr,
-        validation_split=0.1,
-        epochs=epochs,
-        batch_size=32,
-        callbacks=[es],
-        verbose=0,
-    )
-
-    test_pred = scaler.inverse_transform(model.predict(Xte, verbose=0))
-    test_true = scaler.inverse_transform(yte.reshape(-1, 1))
-    mae = round(float(mean_absolute_error(test_true, test_pred)), 4)
-
-    # Iterative forecast: feed predictions back as input
-    seq = scaled[-LOOK_BACK:].copy()
-    for _ in range(horizon):
-        inp  = seq[-LOOK_BACK:].reshape(1, LOOK_BACK, 1)
-        nxt  = model.predict(inp, verbose=0)[0][0]
-        seq  = np.append(seq, nxt)
-    pred = float(scaler.inverse_transform([[seq[-1]]])[0][0])
-
-    return {"model": "LSTM", "predicted": round(pred, 2), "mae": mae}
-
-
-# ── STEP 9: Ensemble ──────────────────────────────────────────────────────
-def ensemble(lr: dict, rf: dict, lstm: dict, current: float) -> dict:
-    """
-    MAE-inverse weighted average of the 3 model predictions.
-    Confidence = 1 − (std / mean) of predictions, scaled 0-100.
-    """
-    def inv(x): return 1.0 / (x + 1e-6)
     wlr, wrf, wlstm = inv(lr["mae"]), inv(rf["mae"]), inv(lstm["mae"])
-    total_w  = wlr + wrf + wlstm
-    final    = (wlr * lr["predicted"] + wrf * rf["predicted"] + wlstm * lstm["predicted"]) / total_w
+    total_w = wlr + wrf + wlstm
+    final = (wlr * lr["predicted"] + wrf * rf["predicted"] + wlstm * lstm["predicted"]) / total_w
 
-    preds      = np.array([lr["predicted"], rf["predicted"], lstm["predicted"]])
-    cv         = preds.std() / (preds.mean() + 1e-9)
+    preds = np.array([lr["predicted"], rf["predicted"], lstm["predicted"]])
+    cv = preds.std() / (preds.mean() + 1e-9)
     confidence = round(max(0.0, min(1.0, 1 - cv)) * 100, 1)
-    pct        = round((final - current) / current * 100, 2)
+    pct = round((final - current) / current * 100, 2)
 
     return {
-        "final":      round(final, 2),
+        "final": round(final, 2),
         "pct_change": pct,
         "confidence": confidence,
-        "current":    round(current, 2),
+        "current": round(current, 2),
     }
 
 
-# ── STEP 10: Decision ─────────────────────────────────────────────────────
-def make_signal(ens: dict, sent: dict) -> dict:
-    """
-    BUY  → sentiment > 0.55 AND predicted growth > +1%
-    SELL → sentiment < 0.45 AND predicted growth < -1%
-    HOLD → everything else
-    """
-    ss  = sent["score"]
-    g   = ens["pct_change"]
-    if   ss > 0.55 and g >  1.0: signal = "BUY"
-    elif ss < 0.45 and g < -1.0: signal = "SELL"
-    else:                         signal = "HOLD"
+def make_signal(ens: Dict, sent: Dict) -> Dict:
+    ss = sent["score"]
+    g = ens["pct_change"]
+    if ss > 0.55 and g > 1.0:
+        signal = "BUY"
+    elif ss < 0.45 and g < -1.0:
+        signal = "SELL"
+    else:
+        signal = "HOLD"
 
     reasons = {
-        "BUY":  f"Bullish sentiment ({ss:.0%}) combined with +{g:.1f}% projected growth",
+        "BUY": f"Bullish sentiment ({ss:.0%}) combined with +{g:.1f}% projected growth",
         "SELL": f"Bearish sentiment ({ss:.0%}) combined with {g:.1f}% projected decline",
         "HOLD": f"Mixed signals — sentiment {ss:.0%}, projected change {g:+.1f}%",
     }
     return {"signal": signal, "reason": reasons[signal]}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# HELPER DISPLAY
-# ══════════════════════════════════════════════════════════════════════════════
-
 def fmt(val: float, currency: str = "USD") -> str:
-    sym = {"USD":"$","INR":"₹","EUR":"€","GBP":"£"}.get(currency, currency+" ")
+    sym = {"USD": "$", "INR": "₹", "EUR": "€", "GBP": "£"}.get(currency, currency + " ")
     return f"{sym}{val:,.2f}"
 
-def volatility(df: pd.DataFrame) -> tuple[float, str]:
+
+def volatility(df: pd.DataFrame) -> Tuple[float, str]:
     v = df["Close"].pct_change().std() * (252**0.5) * 100
     lbl = "Low 🟢" if v < 20 else ("Medium 🟡" if v < 40 else "High 🔴")
     return round(v, 1), lbl
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN UI
-# ══════════════════════════════════════════════════════════════════════════════
+def render_pipeline(states: Dict, placeholder) -> None:
+    html = "<div style='margin-top:8px;'>"
+    for idx, (num, label) in enumerate(STEPS):
+        state = states.get(idx, "wait")
+        dot_cls = {"wait": "dot-wait", "active": "dot-active", "done": "dot-done", "error": "dot-error"}[state]
+        row_cls = {"wait": "", "active": " active", "done": " done", "error": " error"}[state]
+        icon = {"wait": "○", "active": "◉", "done": "✓", "error": "✗"}[state]
+        html += (
+            f"<div class='step-row{row_cls}'>"
+            f"<span class='step-dot {dot_cls}'></span>"
+            f"<span style='color:#3d4f6e;'>STEP {num}</span>"
+            f"<span style='flex:1'>{label}</span>"
+            f"<span>{icon}</span>"
+            "</div>"
+        )
+    html += "</div>"
+    placeholder.markdown(html, unsafe_allow_html=True)
 
-def main():
-    # ── Header ───────────────────────────────────────────────────────────
-    st.markdown("""
-    <div class='app-header'>
-        <div class='app-title'>📡 AI STOCK ANALYST</div>
-        <div class='app-sub'>LIVE DATA · BERT · LINEAR REGRESSION · RANDOM FOREST · LSTM · ENSEMBLE</div>
-    </div>
-    """, unsafe_allow_html=True)
 
-    # ── Sidebar ───────────────────────────────────────────────────────────
+def main() -> None:
+    warmup_models()
+
+    st.markdown(
+        """
+        <div class='app-header'>
+            <div class='app-title'>📡 AI STOCK ANALYST</div>
+            <div class='app-sub'>LIVE DATA · BERT · LINEAR REGRESSION · RANDOM FOREST · LSTM · ENSEMBLE</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if "run_inputs" not in st.session_state:
+        st.session_state["run_inputs"] = None
+
     with st.sidebar:
-        st.markdown("<div style='font-family:IBM Plex Mono,monospace;font-size:0.8rem;color:#3d4f6e;letter-spacing:3px;'>CONFIGURATION</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div style='font-family:IBM Plex Mono,monospace;font-size:0.8rem;color:#3d4f6e;letter-spacing:3px;'>CONFIGURATION</div>",
+            unsafe_allow_html=True,
+        )
         st.markdown("---")
-        news_api_key  = st.text_input("NewsAPI Key", type="password", placeholder="Paste key from newsapi.org")
-        horizon       = st.slider("Forecast Horizon (days)", 5, 30, 7)
-        max_articles  = st.slider("News Articles to Fetch", 5, 20, 12)
-        lstm_epochs   = st.slider("LSTM Epochs", 5, 20, 8)
-        skip_lstm     = st.toggle("Skip LSTM (faster)", value=False)
+
+        news_api_key = get_secret("NEWS_API_KEY")
+        if news_api_key:
+            st.success("NewsAPI: configured")
+        else:
+            st.warning("NewsAPI: missing. Set NEWS_API_KEY in env.")
+
+        with st.form("config_form", clear_on_submit=False):
+            ticker_input = st.text_input(
+                "Ticker",
+                value=st.session_state.get("ticker_input", ""),
+                placeholder="Enter ticker e.g. AAPL / TSLA / TCS.NS",
+            )
+            horizon = st.slider("Forecast Horizon (days)", 5, 30, 7)
+            max_articles = st.slider("News Articles to Fetch", 5, 20, MAX_ARTICLES_DEFAULT)
+            lstm_epochs = st.slider("LSTM Epochs", 3, 12, 6)
+            lightweight = st.toggle(
+                "Lightweight mode (cloud-safe)",
+                value=(LIGHTWEIGHT_ENV or is_cloud_env()),
+            )
+            skip_lstm = st.toggle("Skip LSTM (faster)", value=False)
+            use_cache = st.toggle("Use cache (faster)", value=True)
+            debug_fetch = st.toggle("Debug fetch logs", value=DEBUG_FETCH_ENV)
+            submit = st.form_submit_button("RUN →")
 
         st.markdown("---")
-        st.markdown("<div style='font-family:IBM Plex Mono,monospace;font-size:0.8rem;color:#3d4f6e;letter-spacing:3px;'>QUICK TICKERS</div>", unsafe_allow_html=True)
-        quick = ["AAPL","TSLA","TCS.NS","RELIANCE.NS","INFY.NS","MSFT","NVDA","HDFCBANK.NS"]
-        cols  = st.columns(2)
+        st.markdown(
+            "<div style='font-family:IBM Plex Mono,monospace;font-size:0.8rem;color:#3d4f6e;letter-spacing:3px;'>QUICK TICKERS</div>",
+            unsafe_allow_html=True,
+        )
+        quick = ["AAPL", "TSLA", "TCS.NS", "RELIANCE.NS", "INFY.NS", "MSFT", "NVDA", "HDFCBANK.NS"]
+        cols = st.columns(2)
         for i, t in enumerate(quick):
-            if cols[i%2].button(t, key=f"q_{t}"):
-                st.session_state["ticker"] = t
+            if cols[i % 2].button(t, key=f"q_{t}"):
+                st.session_state["ticker_input"] = t
 
         st.markdown("---")
-        st.markdown("<div style='font-family:IBM Plex Mono,monospace;font-size:0.72rem;color:#3d4f6e;'>PIPELINE PROGRESS</div>", unsafe_allow_html=True)
-        pipeline_ph = st.empty()   # placeholder for live step tracker
+        st.markdown(
+            "<div style='font-family:IBM Plex Mono,monospace;font-size:0.72rem;color:#3d4f6e;'>PIPELINE PROGRESS</div>",
+            unsafe_allow_html=True,
+        )
+        pipeline_ph = st.empty()
 
-    # Render initial (all-waiting) pipeline
+        if st.session_state.get("warmup_future"):
+            future = st.session_state["warmup_future"]
+            if future.done():
+                st.caption("Model warmup: ready")
+            else:
+                st.caption("Model warmup: running")
+
     render_pipeline({}, pipeline_ph)
 
-    # ── Ticker Input ──────────────────────────────────────────────────────
-    col_inp, col_btn = st.columns([5, 1])
-    with col_inp:
-        ticker = st.text_input(
-            "ticker", label_visibility="collapsed",
-            value=st.session_state.get("ticker", ""),
-            placeholder="Enter ticker  e.g.  TCS.NS   RELIANCE.NS   AAPL   TSLA",
-        ).strip().upper()
-    with col_btn:
-        go = st.button("RUN →")
+    if submit:
+        st.session_state["run_inputs"] = {
+            "ticker": ticker_input,
+            "horizon": horizon,
+            "max_articles": max_articles,
+            "lstm_epochs": lstm_epochs,
+            "skip_lstm": skip_lstm,
+            "lightweight": lightweight,
+            "use_cache": use_cache,
+        }
+        st.session_state["debug_fetch"] = debug_fetch
 
-    if not go:
-        st.markdown("""
-        <div style='text-align:center;padding:80px 0;'>
-            <div style='font-size:3.5rem;margin-bottom:16px;'>📡</div>
-            <div style='font-family:IBM Plex Mono,monospace;font-size:0.8rem;
-                        color:#3d4f6e;letter-spacing:4px;'>
-                ENTER A TICKER AND PRESS RUN
+    inputs = st.session_state.get("run_inputs")
+    if not inputs:
+        st.markdown(
+            """
+            <div style='text-align:center;padding:80px 0;'>
+                <div style='font-size:3.5rem;margin-bottom:16px;'>📡</div>
+                <div style='font-family:IBM Plex Mono,monospace;font-size:0.8rem; color:#3d4f6e;letter-spacing:4px;'>
+                    ENTER A TICKER AND PRESS RUN
+                </div>
             </div>
-        </div>""", unsafe_allow_html=True)
+            """,
+            unsafe_allow_html=True,
+        )
         return
 
+    ticker = sanitize_ticker(inputs["ticker"])
     if not ticker:
-        st.error("Please enter a stock ticker symbol.")
+        st.error("Please enter a valid ticker symbol (letters, numbers, dot, dash).")
         return
 
-    # ── Pipeline Execution ────────────────────────────────────────────────
-    states  = {}          # step_index → "wait"|"active"|"done"|"error"
-    results = {}          # collected outputs
+    states: Dict[int, str] = {}
+    results: Dict[str, object] = {}
 
-    def tick(idx, status):
+    def tick(idx: int, status: str) -> None:
         states[idx] = status
         render_pipeline(states, pipeline_ph)
 
-    # ─────────────────────────────────────────────────────────────────────
-    # STEP 1: User Input — mark done immediately
     tick(0, "done")
 
-    # ─────────────────────────────────────────────────────────────────────
-    # STEP 2: Fetch Live Stock Data
+    # Step 2: Stock data
     tick(1, "active")
     status_ph = st.empty()
-    status_ph.info("📡 **Step 2** — Fetching live stock data from yfinance…")
+    status_ph.info("📡 **Step 2** — Fetching live stock data…")
     try:
-        df, info = fetch_live_stock(ticker)
-        results["df"]   = df
+        if inputs["use_cache"]:
+            df, info = fetch_live_stock_cached(ticker)
+        else:
+            df, info = fetch_live_stock_uncached(ticker)
+        results["df"] = df
         results["info"] = info
         tick(1, "done")
-        data_ts = datetime.now().strftime("%H:%M:%S")
         status_ph.success(
             f"✅ **{info['name']}** — {len(df)} trading days loaded "
-            f"({df.index[0].date()} → {df.index[-1].date()})  |  fetched at {data_ts}"
+            f"({df.index[0].date()} → {df.index[-1].date()})"
         )
+        if st.session_state.get("using_cached_data"):
+            st.warning("⚠️ Using cached market data due to temporary Yahoo Finance limits.")
+        if st.session_state.get("rate_limited"):
+            st.warning("⏳ Yahoo Finance rate-limited requests. Added cooldown and backoff; try again later if needed.")
     except Exception as e:
         tick(1, "error")
-        status_ph.error(f"❌ Stock data error: {e}")
+        if st.session_state.get("rate_limited"):
+            status_ph.error("❌ Yahoo Finance temporarily rate-limited requests. Please wait a minute and retry.")
+        else:
+            status_ph.error(f"❌ Stock data error: {e}")
+        if st.session_state.get("debug_fetch") and st.session_state.get("fetch_logs"):
+            with st.expander("Stock Fetch Debug Logs", expanded=False):
+                st.json(st.session_state.get("fetch_logs"))
         return
 
-    df      = results["df"]
-    info    = results["info"]
-    cur     = float(df["Close"].iloc[-1])
+    df = results["df"]
+    info = results["info"]
+    cur = float(df["Close"].iloc[-1])
     currency = info["currency"]
     vol, vol_label = volatility(df)
 
-    # Quick stats row
-    c1,c2,c3,c4,c5 = st.columns(5)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Current Price", fmt(cur, currency))
-    c2.metric("Exchange",      info["exchange"] or "—")
-    c3.metric("Sector",        info["sector"])
-    c4.metric("Volatility",    f"{vol}%", vol_label)
+    c2.metric("Exchange", info["exchange"] or "—")
+    c3.metric("Sector", info["sector"])
+    c4.metric("Volatility", f"{vol}%", vol_label)
     mktcap = info["market_cap"]
-    c5.metric("Market Cap",    f"{mktcap/1e9:.1f}B {currency}" if mktcap else "—")
+    c5.metric("Market Cap", f"{mktcap/1e9:.1f}B {currency}" if mktcap else "—")
 
     st.markdown(
         f"<div class='live-badge'><span class='live-dot'></span>LIVE — data through {df.index[-1].date()}</div>",
@@ -684,18 +1039,21 @@ def main():
 
     st.divider()
 
-    # ─────────────────────────────────────────────────────────────────────
-    # STEP 3: Fetch Live News
+    # Step 3: News
     tick(2, "active")
     news_ph = st.empty()
     if not news_api_key:
-        news_ph.warning("⚠️ **Step 3** — No NewsAPI key provided. Skipping news; using neutral sentiment.")
+        news_ph.warning("⚠️ **Step 3** — NEWS_API_KEY missing. Using neutral sentiment.")
         tick(2, "done")
         results["articles"] = []
     else:
-        news_ph.info(f"📰 **Step 3** — Fetching latest {max_articles} news articles…")
+        news_ph.info(f"📰 **Step 3** — Fetching latest {inputs['max_articles']} news articles…")
         try:
-            articles = fetch_live_news(ticker, info["name"], news_api_key, max_articles)
+            query = info["name"] if info["name"] and info["name"] != ticker else ticker
+            if inputs["use_cache"]:
+                articles = fetch_live_news_cached(query, news_api_key, inputs["max_articles"])
+            else:
+                articles = fetch_live_news_uncached(query, news_api_key, inputs["max_articles"])
             results["articles"] = articles
             tick(2, "done")
             news_ph.success(f"✅ **Step 3** — {len(articles)} live articles fetched")
@@ -704,216 +1062,268 @@ def main():
             news_ph.error(f"❌ News fetch error: {e}")
             results["articles"] = []
 
-    # ─────────────────────────────────────────────────────────────────────
-    # STEP 4: BERT Sentiment
+    # Step 4: Sentiment
     tick(3, "active")
     sent_ph = st.empty()
     articles = results["articles"]
 
     if not articles:
-        sent_ph.info("⚪ **Step 4** — No articles to classify. Using neutral (0.5) sentiment.")
+        sent_ph.info("⚪ **Step 4** — No articles to classify. Using neutral sentiment.")
         tick(3, "done")
-        results["sentiment"] = {
-            "articles": [], "counts": {"positive":0,"neutral":1,"negative":0},
-            "pct_pos": 0, "pct_neu": 100, "pct_neg": 0,
-            "score": 0.5, "overall": "Neutral",
-        }
+        results["sentiment"] = run_bert_sentiment([])
     else:
         sent_ph.info(f"🤖 **Step 4** — Running BERT on {len(articles)} headlines…")
         t0 = time.time()
-        sent = run_bert_sentiment(articles)
-        results["sentiment"] = sent
-        tick(3, "done")
-        sent_ph.success(
-            f"✅ **Step 4** — BERT done in {time.time()-t0:.1f}s  |  "
-            f"Positive {sent['pct_pos']}%  Neutral {sent['pct_neu']}%  Negative {sent['pct_neg']}%  |  "
-            f"Overall: **{sent['overall']}**"
-        )
+        try:
+            sent = run_bert_sentiment(articles)
+            results["sentiment"] = sent
+            tick(3, "done")
+            sent_ph.success(
+                f"✅ **Step 4** — BERT done in {time.time()-t0:.1f}s  |  "
+                f"Positive {sent['pct_pos']}%  Neutral {sent['pct_neu']}%  Negative {sent['pct_neg']}%  |  "
+                f"Overall: **{sent['overall']}**"
+            )
+        except Exception as e:
+            tick(3, "error")
+            sent_ph.error(f"❌ Sentiment error: {e}")
+            results["sentiment"] = run_bert_sentiment([])
 
-    # Sentiment section render
     sent = results["sentiment"]
     with st.expander("📰 Sentiment Detail", expanded=False):
-        s1,s2,s3 = st.columns(3)
+        s1, s2, s3 = st.columns(3)
         s1.metric("✅ Positive", f"{sent['pct_pos']}%", f"{sent['counts']['positive']} articles")
-        s2.metric("⚪ Neutral",  f"{sent['pct_neu']}%", f"{sent['counts']['neutral']} articles")
+        s2.metric("⚪ Neutral", f"{sent['pct_neu']}%", f"{sent['counts']['neutral']} articles")
         s3.metric("🔴 Negative", f"{sent['pct_neg']}%", f"{sent['counts']['negative']} articles")
-        st.markdown(f"""
-        <div class='sent-bar-wrap'>
-            <div style='width:{sent["pct_pos"]}%;background:#3fb950'></div>
-            <div style='width:{sent["pct_neu"]}%;background:#d29922'></div>
-            <div style='width:{sent["pct_neg"]}%;background:#f85149'></div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div class='sent-bar-wrap'>
+                <div style='width:{sent['pct_pos']}%;background:#3fb950'></div>
+                <div style='width:{sent['pct_neu']}%;background:#d29922'></div>
+                <div style='width:{sent['pct_neg']}%;background:#f85149'></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         for art in sent["articles"]:
-            css = {"positive":"news-pos","negative":"news-neg","neutral":"news-neu"}[art["sentiment"]]
-            ico = {"positive":"🟢","negative":"🔴","neutral":"🟡"}[art["sentiment"]]
-            st.markdown(f"""
-            <div class='news-item {css}'>
-                {ico} <strong>{art['title']}</strong><br>
-                <span style='color:#6e7681;font-size:0.76rem;'>
-                    {art['source']} · {art['date']} · {art['sentiment'].upper()} ({art['confidence']:.0%})
-                    &nbsp;<a href='{art["url"]}' target='_blank' style='color:#58a6ff;'>↗</a>
-                </span>
-            </div>""", unsafe_allow_html=True)
+            css = {"positive": "news-pos", "negative": "news-neg", "neutral": "news-neu"}[art["sentiment"]]
+            ico = {"positive": "🟢", "negative": "🔴", "neutral": "🟡"}[art["sentiment"]]
+            st.markdown(
+                f"""
+                <div class='news-item {css}'>
+                    {ico} <strong>{art['title']}</strong><br>
+                    <span style='color:#6e7681;font-size:0.76rem;'>
+                        {art['source']} · {art['date']} · {art['sentiment'].upper()} ({art['confidence']:.0%})
+                        &nbsp;<a href='{art['url']}' target='_blank' style='color:#58a6ff;'>↗</a>
+                    </span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
     st.divider()
-    st.markdown(f"### 📈 Model Training & Prediction  (horizon: +{horizon} days)")
+    st.markdown(f"### 📈 Model Training & Prediction  (horizon: +{inputs['horizon']} days)")
 
-    # ─────────────────────────────────────────────────────────────────────
-    # STEP 5: Feature Engineering
+    # Step 5: Features
     tick(4, "active")
     feat_ph = st.empty()
-    feat_ph.info("🔧 **Step 5** — Engineering features from live data…")
-    feat = engineer_features(df)
-    tick(4, "done")
-    feat_ph.success(f"✅ **Step 5** — Features ready: {list(feat.columns)} ({len(feat)} rows)")
+    feat_ph.info("🔧 **Step 5** — Engineering features…")
+    sig = data_signature(df)
+    try:
+        if inputs["use_cache"]:
+            feat = engineer_features_cached(df, sig)
+        else:
+            feat = engineer_features_uncached(df)
+        tick(4, "done")
+        feat_ph.success(f"✅ **Step 5** — Features ready: {list(feat.columns)} ({len(feat)} rows)")
+    except Exception as e:
+        tick(4, "error")
+        feat_ph.error(f"❌ Feature engineering error: {e}")
+        return
 
-    # ─────────────────────────────────────────────────────────────────────
-    # STEP 6: Linear Regression
+    # Step 6: Linear Regression
     tick(5, "active")
     lr_ph = st.empty()
-    lr_ph.info("📐 **Step 6** — Training Linear Regression on live data…")
+    lr_ph.info("📐 **Step 6** — Training Linear Regression…")
     t0 = time.time()
-    lr_res = train_linear_regression(feat, horizon)
-    results["lr"] = lr_res
-    tick(5, "done")
-    lr_ph.success(
-        f"✅ **Step 6** — Linear Regression trained in {time.time()-t0:.1f}s  |  "
-        f"Predicted price: **{fmt(lr_res['predicted'], currency)}**  |  MAE: {lr_res['mae']}"
-    )
+    try:
+        if inputs["use_cache"]:
+            lr_res = train_linear_regression_cached(feat, inputs["horizon"], sig)
+        else:
+            lr_res = train_linear_regression_uncached(feat, inputs["horizon"])
+        tick(5, "done")
+        lr_ph.success(
+            f"✅ **Step 6** — Linear Regression in {time.time()-t0:.1f}s  |  "
+            f"Predicted price: **{fmt(lr_res['predicted'], currency)}**  |  MAE: {lr_res['mae']}"
+        )
+    except Exception as e:
+        tick(5, "error")
+        lr_ph.error(f"❌ Linear Regression error: {e}")
+        return
 
-    # ─────────────────────────────────────────────────────────────────────
-    # STEP 7: Random Forest
+    # Step 7: Random Forest
     tick(6, "active")
     rf_ph = st.empty()
-    rf_ph.info("🌲 **Step 7** — Training Random Forest (200 trees) on live data…")
+    rf_ph.info("🌲 **Step 7** — Training Random Forest…")
     t0 = time.time()
-    rf_res = train_random_forest(feat, horizon)
-    results["rf"] = rf_res
-    tick(6, "done")
-    rf_ph.success(
-        f"✅ **Step 7** — Random Forest trained in {time.time()-t0:.1f}s  |  "
-        f"Predicted price: **{fmt(rf_res['predicted'], currency)}**  |  MAE: {rf_res['mae']}"
-    )
+    try:
+        if inputs["use_cache"]:
+            rf_res = train_random_forest_cached(feat, inputs["horizon"], sig)
+        else:
+            rf_res = train_random_forest_uncached(feat, inputs["horizon"])
+        tick(6, "done")
+        rf_ph.success(
+            f"✅ **Step 7** — Random Forest in {time.time()-t0:.1f}s  |  "
+            f"Predicted price: **{fmt(rf_res['predicted'], currency)}**  |  MAE: {rf_res['mae']}"
+        )
+    except Exception as e:
+        tick(6, "error")
+        rf_ph.error(f"❌ Random Forest error: {e}")
+        return
 
-    # ─────────────────────────────────────────────────────────────────────
-    # STEP 8: LSTM
-    if skip_lstm:
+    # Step 8: LSTM
+    if inputs["skip_lstm"]:
         tick(7, "done")
-        lstm_res = {"model":"LSTM (skipped)","predicted":rf_res["predicted"],"mae":rf_res["mae"]}
+        lstm_res = {"model": "LSTM (skipped)", "predicted": rf_res["predicted"], "mae": rf_res["mae"]}
         st.info("⏩ **Step 8** — LSTM skipped (toggle off in sidebar).")
     else:
         tick(7, "active")
         lstm_ph = st.empty()
-        lstm_ph.info(f"🧠 **Step 8** — Training LSTM ({lstm_epochs} epochs) on live data…")
+        lstm_ph.info("🧠 **Step 8** — Training LSTM…")
         t0 = time.time()
-        lstm_res = train_lstm(df, horizon, lstm_epochs)
-        results["lstm"] = lstm_res
-        tick(7, "done")
-        lstm_ph.success(
-            f"✅ **Step 8** — LSTM trained in {time.time()-t0:.1f}s  |  "
-            f"Predicted price: **{fmt(lstm_res['predicted'], currency)}**  |  MAE: {lstm_res['mae']}"
-        )
+        try:
+            if inputs["use_cache"]:
+                lstm_res = train_lstm_cached(
+                    df,
+                    inputs["horizon"],
+                    inputs["lstm_epochs"],
+                    inputs["lightweight"],
+                    sig,
+                )
+            else:
+                lstm_res = train_lstm_uncached(
+                    df,
+                    inputs["horizon"],
+                    inputs["lstm_epochs"],
+                    inputs["lightweight"],
+                )
+            tick(7, "done")
+            lstm_ph.success(
+                f"✅ **Step 8** — LSTM in {time.time()-t0:.1f}s  |  "
+                f"Predicted price: **{fmt(lstm_res['predicted'], currency)}**  |  MAE: {lstm_res['mae']}"
+            )
+        except Exception as e:
+            tick(7, "error")
+            lstm_ph.error(f"❌ LSTM error: {e}  |  Falling back to Random Forest.")
+            lstm_res = {"model": "LSTM (fallback)", "predicted": rf_res["predicted"], "mae": rf_res["mae"]}
 
     st.divider()
 
-    # ─────────────────────────────────────────────────────────────────────
-    # STEP 9: Ensemble
+    # Step 9: Ensemble
     tick(8, "active")
     ens_ph = st.empty()
     ens_ph.info("⚗️ **Step 9** — Computing MAE-weighted ensemble…")
     ens = ensemble(lr_res, rf_res, lstm_res, cur)
-    results["ensemble"] = ens
     tick(8, "done")
     ens_ph.success(
         f"✅ **Step 9** — Ensemble prediction: **{fmt(ens['final'], currency)}**  |  "
         f"Change: {ens['pct_change']:+.2f}%  |  Confidence: {ens['confidence']}%"
     )
 
-    # Model comparison table
     st.markdown("#### Model Comparison")
-    st.markdown("""
-    <div class='model-row header'>
-        <div>MODEL</div><div>PREDICTED PRICE</div><div>MAE (test set)</div><div>WEIGHT BASIS</div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class='model-row header'>
+            <div>MODEL</div><div>PREDICTED PRICE</div><div>MAE (test set)</div><div>WEIGHT BASIS</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     for r in [lr_res, rf_res, lstm_res]:
         arrow = "🔼" if r["predicted"] >= cur else "🔽"
-        st.markdown(f"""
-        <div class='model-row'>
-            <div style='color:#8b949e'>{r['model']}</div>
-            <div style='color:#e6edf3'>{arrow} {fmt(r['predicted'], currency)}</div>
-            <div style='color:#8b949e'>{r['mae']}</div>
-            <div style='color:#3d4f6e'>1/MAE</div>
-        </div>""", unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div class='model-row'>
+                <div style='color:#8b949e'>{r['model']}</div>
+                <div style='color:#e6edf3'>{arrow} {fmt(r['predicted'], currency)}</div>
+                <div style='color:#8b949e'>{r['mae']}</div>
+                <div style='color:#3d4f6e'>1/MAE</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    # Ensemble summary
-    e1,e2,e3,e4 = st.columns(4)
-    e1.metric("Current Price",      fmt(cur, currency))
-    e2.metric(f"Ensemble (+{horizon}d)", fmt(ens["final"], currency))
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("Current Price", fmt(cur, currency))
+    e2.metric(f"Ensemble (+{inputs['horizon']}d)", fmt(ens["final"], currency))
     delta_sign = "+" if ens["pct_change"] >= 0 else ""
-    e3.metric("Expected Change",     f"{delta_sign}{ens['pct_change']}%")
-    e4.metric("Confidence",          f"{ens['confidence']}%")
+    e3.metric("Expected Change", f"{delta_sign}{ens['pct_change']}%")
+    e4.metric("Confidence", f"{ens['confidence']}%")
 
-    st.markdown(f"""
-    <div style='margin:10px 0'>
-        <div style='font-family:IBM Plex Mono,monospace;font-size:0.7rem;color:#3d4f6e;letter-spacing:2px;'>
-            CONFIDENCE
+    st.markdown(
+        f"""
+        <div style='margin:10px 0'>
+            <div style='font-family:IBM Plex Mono,monospace;font-size:0.7rem;color:#3d4f6e;letter-spacing:2px;'>
+                CONFIDENCE
+            </div>
+            <div class='conf-bar-wrap'>
+                <div class='conf-bar-fill' style='width:{ens['confidence']}%'></div>
+            </div>
         </div>
-        <div class='conf-bar-wrap'>
-            <div class='conf-bar-fill' style='width:{ens["confidence"]}%'></div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
-    # Price chart
     with st.expander("📉 Historical Price (Last 1Y)", expanded=True):
-        st.line_chart(df[["Close"]].tail(252), use_container_width=True, color="#1f6feb")
+        price_view = df[["Close"]].tail(252)
+        st.line_chart(price_view, use_container_width=True, color="#1f6feb")
 
     st.divider()
 
-    # ─────────────────────────────────────────────────────────────────────
-    # STEP 10: Signal
+    # Step 10: Signal
     tick(9, "active")
     sig_ph = st.empty()
     sig_ph.info("🤖 **Step 10** — Generating final signal…")
     decision = make_signal(ens, sent)
-    sig       = decision["signal"]
+    sig = decision["signal"]
     tick(9, "done")
     sig_ph.success(f"✅ **Step 10** — Signal: **{sig}**")
 
     st.markdown("### 🎯 Final AI Signal")
-    st.markdown(f"""
-    <div class='signal-box signal-{sig}'>
-        <div class='signal-word-{sig}'>{sig}</div>
-        <div class='signal-reason'>{decision['reason']}</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # Full summary
-    st.markdown("#### 📋 Full Run Summary")
-    summary_data = {
-        "Ticker":                  ticker,
-        "Company":                 info["name"],
-        "Data Range":              f"{df.index[0].date()} → {df.index[-1].date()}",
-        "Current Price":           fmt(cur, currency),
-        "Linear Regression Pred":  fmt(lr_res["predicted"], currency),
-        "Random Forest Pred":      fmt(rf_res["predicted"], currency),
-        "LSTM Pred":               fmt(lstm_res["predicted"], currency),
-        f"Ensemble Pred (+{horizon}d)": fmt(ens["final"], currency),
-        "Expected Growth":         f"{ens['pct_change']:+.2f}%",
-        "Model Confidence":        f"{ens['confidence']}%",
-        "Annualised Volatility":   f"{vol}% ({vol_label})",
-        "Sentiment Score":         f"{sent['score']:.2f} / 1.00  ({sent['overall']})",
-        "Articles Analysed":       str(len(articles)),
-        "🤖 AI Signal":             sig,
-        "Reason":                  decision["reason"],
-        "Run Timestamp":           datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    st.table(
-        pd.DataFrame(summary_data.items(), columns=["Metric","Value"]).set_index("Metric")
+    st.markdown(
+        f"""
+        <div class='signal-box signal-{sig}'>
+            <div class='signal-word-{sig}'>{sig}</div>
+            <div class='signal-reason'>{decision['reason']}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
+    st.markdown("#### 📋 Full Run Summary")
+    summary_data = {
+        "Ticker": ticker,
+        "Company": info["name"],
+        "Data Range": f"{df.index[0].date()} → {df.index[-1].date()}",
+        "Current Price": fmt(cur, currency),
+        "Linear Regression Pred": fmt(lr_res["predicted"], currency),
+        "Random Forest Pred": fmt(rf_res["predicted"], currency),
+        "LSTM Pred": fmt(lstm_res["predicted"], currency),
+        f"Ensemble Pred (+{inputs['horizon']}d)": fmt(ens["final"], currency),
+        "Expected Growth": f"{ens['pct_change']:+.2f}%",
+        "Model Confidence": f"{ens['confidence']}%",
+        "Annualised Volatility": f"{vol}% ({vol_label})",
+        "Sentiment Score": f"{sent['score']:.2f} / 1.00  ({sent['overall']})",
+        "Articles Analysed": str(len(articles)),
+        "🤖 AI Signal": sig,
+        "Reason": decision["reason"],
+        "Run Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    st.table(pd.DataFrame(summary_data.items(), columns=["Metric", "Value"]).set_index("Metric"))
+
+    cloud_state = "Cloud" if is_cloud_env() else "Local"
+    st.caption(
+        f"Runtime: {cloud_state} | Cache TTL: {DEFAULT_CACHE_TTL}s | Lightweight: {inputs['lightweight']}"
+    )
     st.caption(
         "⚠️ **Disclaimer**: Educational / research use only. Not financial advice. "
         "Past performance does not guarantee future results."

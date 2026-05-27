@@ -1,13 +1,11 @@
-# AI Stock Analyst — requirements
-# pip install torch --index-url https://download.pytorch.org/whl/cpu
-# pip install -r requirements.txt
-
-yfinance>=0.2.36
-pandas>=2.0.0
-numpy>=1.24.0
-scikit-learn>=1.3.0
-tensorflow>=2.13.0
-transformers>=4.35.0
-torch>=2.0.0
-requests>=2.31.0
-streamlit>=1.32.0
+# AI Stock Analyst — production requirements (Python 3.11)
+streamlit==1.36.0
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.4.2
+tensorflow==2.16.1
+transformers==4.44.2
+torch==2.2.2
+yfinance==0.2.54
+requests==2.32.3
+python-dotenv==1.0.1
