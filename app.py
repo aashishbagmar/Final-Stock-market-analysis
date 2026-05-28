@@ -8,9 +8,11 @@ import os
 import re
 import time
 import hashlib
+import json
 import logging
 import warnings
 from datetime import datetime
+from threading import Lock
 from typing import Dict, List, Tuple, Optional
 
 # --- Third-party ---
@@ -23,6 +25,7 @@ import yfinance as yf
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from sklearn.base import clone
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import MinMaxScaler
@@ -51,20 +54,21 @@ if load_dotenv:
     load_dotenv(override=False)
 
 # --- Config ---
-DEFAULT_CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "900"))
-CACHE_TTL_STOCK = int(os.getenv("CACHE_TTL_STOCK", "300"))
-CACHE_TTL_NEWS = int(os.getenv("CACHE_TTL_NEWS", "600"))
-CACHE_TTL_FEATURES = int(os.getenv("CACHE_TTL_FEATURES", "3600"))
-CACHE_TTL_MODELS = int(os.getenv("CACHE_TTL_MODELS", "3600"))
-CACHE_TTL_SENTIMENT = int(os.getenv("CACHE_TTL_SENTIMENT", "3600"))
-CACHE_TTL_INFO = int(os.getenv("CACHE_TTL_INFO", "21600"))
+DEFAULT_CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "7200"))
+CACHE_TTL_STOCK = int(os.getenv("CACHE_TTL_STOCK", "7200"))
+CACHE_TTL_NEWS = int(os.getenv("CACHE_TTL_NEWS", "7200"))
+CACHE_TTL_FEATURES = int(os.getenv("CACHE_TTL_FEATURES", "7200"))
+CACHE_TTL_MODELS = int(os.getenv("CACHE_TTL_MODELS", "7200"))
+CACHE_TTL_SENTIMENT = int(os.getenv("CACHE_TTL_SENTIMENT", "7200"))
+CACHE_TTL_INFO = int(os.getenv("CACHE_TTL_INFO", "7200"))
 MAX_ARTICLES_DEFAULT = int(os.getenv("MAX_NEWS_ARTICLES", "12"))
 MAX_LSTM_EPOCHS = int(os.getenv("LSTM_MAX_EPOCHS", "10"))
 LIGHTWEIGHT_ENV = os.getenv("LIGHTWEIGHT_MODE", "").lower() in ("1", "true", "yes")
 DEBUG_FETCH_ENV = os.getenv("DEBUG_FETCH", "").lower() in ("1", "true", "yes")
-YF_MIN_INTERVAL = float(os.getenv("YF_MIN_INTERVAL", "1.2"))
-YF_MAX_RETRIES = int(os.getenv("YF_MAX_RETRIES", "2"))
-YF_TIMEOUT = int(os.getenv("YF_TIMEOUT", "10"))
+YF_MIN_INTERVAL = float(os.getenv("YF_MIN_INTERVAL", "6.0"))
+YF_MAX_RETRIES = int(os.getenv("YF_MAX_RETRIES", "1"))
+YF_TIMEOUT = int(os.getenv("YF_TIMEOUT", "12"))
+YF_COOLDOWN_SECONDS = int(os.getenv("YF_COOLDOWN_SECONDS", "90"))
 
 TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-^]{0,12}$")
 
@@ -158,7 +162,7 @@ STEPS = [
     ("01", "User Input"),
     ("02", "Fetch Live Stock Data"),
     ("03", "Fetch Live News"),
-    ("04", "BERT Sentiment Analysis"),
+    ("04", "Sentiment Analysis (VADER)"),
     ("05", "Feature Engineering"),
     ("06", "Train Linear Regression"),
     ("07", "Train Random Forest"),
@@ -228,16 +232,27 @@ def build_ticker_candidates(ticker: str) -> List[str]:
 class RateLimiter:
     def __init__(self, min_interval: float) -> None:
         self.min_interval = min_interval
+        self._lock = Lock()
         self._last_call = 0.0
+        self._cooldown_until = 0.0
 
     def wait(self) -> float:
-        now = time.monotonic()
-        elapsed = now - self._last_call
-        remaining = self.min_interval - elapsed
-        if remaining > 0:
-            time.sleep(remaining)
-        self._last_call = time.monotonic()
-        return max(0.0, remaining)
+        with self._lock:
+            now = time.monotonic()
+            if self._cooldown_until > now:
+                time.sleep(self._cooldown_until - now)
+                now = time.monotonic()
+            elapsed = now - self._last_call
+            remaining = self.min_interval - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+            self._last_call = time.monotonic()
+            return max(0.0, remaining)
+
+    def cooldown(self, seconds: float) -> None:
+        with self._lock:
+            now = time.monotonic()
+            self._cooldown_until = max(self._cooldown_until, now + seconds)
 
 
 @st.cache_resource(show_spinner=False)
@@ -252,27 +267,64 @@ def is_rate_limit_error(err: Exception) -> bool:
     return "rate limit" in msg or "too many requests" in msg or "429" in msg
 
 
-def backoff_delay(attempt: int) -> float:
-    base = 0.6 * (2 ** (attempt - 1))
-    jitter = 0.2 * np.random.random()
-    return min(3.2, base + jitter)
+def make_run_key(ticker: str, inputs: Dict, effective_lightweight: bool, effective_skip_lstm: bool) -> str:
+    payload = {
+        "ticker": ticker,
+        "horizon": inputs.get("horizon"),
+        "max_articles": inputs.get("max_articles"),
+        "lstm_epochs": inputs.get("lstm_epochs"),
+        "skip_lstm": effective_skip_lstm,
+        "lightweight": effective_lightweight,
+        "use_cache": inputs.get("use_cache"),
+    }
+    raw = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def get_tf():
-    import tensorflow as tf
+    try:
+        import tensorflow as tf
+        return tf
+    except ImportError:
+        raise RuntimeError(
+            "TensorFlow is not installed. Install it or enable 'Skip LSTM' in the sidebar."
+        )
 
-    return tf
+
+@st.cache_resource(show_spinner=False)
+def get_scaler_template() -> MinMaxScaler:
+    return MinMaxScaler()
+
+
+def new_scaler() -> MinMaxScaler:
+    return clone(get_scaler_template())
+@st.cache_resource(show_spinner=False)
+def get_lstm_model_factory():
+    def build(look_back: int, units_1: int, units_2: int):
+        tf = get_tf()
+        Sequential = tf.keras.models.Sequential
+        LSTM = tf.keras.layers.LSTM
+        Dense = tf.keras.layers.Dense
+        Dropout = tf.keras.layers.Dropout
+        model = Sequential(
+            [
+                LSTM(units_1, return_sequences=True, input_shape=(look_back, 1)),
+                Dropout(0.2),
+                LSTM(units_2),
+                Dropout(0.2),
+                Dense(16, activation="relu"),
+                Dense(1),
+            ]
+        )
+        model.compile(optimizer="adam", loss="huber")
+        return model
+
+    return build
 
 
 def get_transformers():
-    try:
-        from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline as hf_pipeline
-
-        return hf_pipeline, AutoModelForSequenceClassification, AutoTokenizer
-    except Exception:
-        from transformers import pipeline as hf_pipeline
-
-        return hf_pipeline, None, None
+    # Retained for compatibility; BERT replaced by VADER for cloud memory safety.
+    return None, None, None
 
 
 def validate_ohlcv(df: pd.DataFrame, min_rows: int = 30) -> Tuple[bool, pd.DataFrame, str]:
@@ -313,11 +365,11 @@ def get_ticker_info_cached(ticker: str) -> Dict:
         fast = getattr(t, "fast_info", None)
         if fast:
             info = {
-                "name": fast.get("shortName") or fast.get("longName") or ticker,
-                "currency": fast.get("currency", "USD"),
-                "exchange": fast.get("exchange", ""),
+                "name": getattr(fast, "shortName", None) or getattr(fast, "longName", None) or ticker,
+                "currency": getattr(fast, "currency", "USD") or "USD",
+                "exchange": getattr(fast, "exchange", "") or "",
                 "sector": "N/A",
-                "market_cap": fast.get("marketCap", 0),
+                "market_cap": getattr(fast, "marketCap", 0) or 0,
             }
     except Exception:
         info = {}
@@ -388,24 +440,14 @@ def get_yf_session() -> requests.Session:
 
 @st.cache_resource(show_spinner=False)
 def load_bert_pipeline():
-    hf_pipeline, AutoModelForSequenceClassification, AutoTokenizer = get_transformers()
-    if AutoTokenizer and AutoModelForSequenceClassification:
-        import torch
-
-        tokenizer = AutoTokenizer.from_pretrained("nlptown/bert-base-multilingual-uncased-sentiment")
-        model = AutoModelForSequenceClassification.from_pretrained(
-            "nlptown/bert-base-multilingual-uncased-sentiment",
-            torch_dtype=torch.float32,
-            low_cpu_mem_usage=True,
-        )
-        torch.set_num_threads(1)
-        return hf_pipeline("text-classification", model=model, tokenizer=tokenizer, device=-1, top_k=1)
-
-    return hf_pipeline(
-        "text-classification",
-        model="nlptown/bert-base-multilingual-uncased-sentiment",
-        top_k=1,
-    )
+    """Load VADER sentiment analyzer — lightweight, no model download required."""
+    try:
+        import nltk
+        from nltk.sentiment import SentimentIntensityAnalyzer
+        nltk.download("vader_lexicon", quiet=True)
+        return SentimentIntensityAnalyzer()
+    except Exception:
+        return None
 
 
 def warmup_models() -> None:
@@ -428,16 +470,15 @@ def fetch_live_stock_uncached(ticker: str) -> Tuple[pd.DataFrame, Dict]:
 
     session = get_yf_session()
     limiter = get_rate_limiter()
+    is_cloud = is_cloud_env()
 
     candidates = build_ticker_candidates(ticker)
     log_fetch_event("candidate_tickers", {"input": ticker, "candidates": candidates}, logs)
 
-    download_plans = [
-        {"period": "2y", "interval": "1d"},
-        {"period": "1y", "interval": "1d"},
-    ]
-
-    max_retries = max(1, min(YF_MAX_RETRIES, 2))
+    # Cloud-safe history length to reduce payload and throttling.
+    period = "1y" if is_cloud else "2y"
+    # Max one retry to avoid retry storms.
+    max_retries = 1 + min(max(YF_MAX_RETRIES, 0), 1)
     timeout = YF_TIMEOUT
 
     ok = False
@@ -447,9 +488,9 @@ def fetch_live_stock_uncached(ticker: str) -> Tuple[pd.DataFrame, Dict]:
             log_fetch_event("download_attempt", {"ticker": cand, "attempt": attempt}, logs)
 
             df = pd.DataFrame()
-            for plan in download_plans:
+            try:
+                limiter.wait()
                 try:
-                    limiter.wait()
                     df = yf.download(
                         cand,
                         progress=False,
@@ -458,40 +499,49 @@ def fetch_live_stock_uncached(ticker: str) -> Tuple[pd.DataFrame, Dict]:
                         threads=False,
                         timeout=timeout,
                         session=session,
-                        **plan,
+                        period=period,
+                        interval="1d",
                     )
-                except Exception as e:
-                    last_error = str(e)
-                    if is_rate_limit_error(e):
-                        st.session_state["rate_limited"] = True
-                    log_fetch_event(
-                        "download_error",
-                        {"ticker": cand, "plan": plan, "error": last_error},
-                        logs,
+                except TypeError:
+                    # Newer yfinance versions don't accept timeout/session/group_by
+                    df = yf.download(
+                        cand,
+                        progress=False,
+                        auto_adjust=False,
+                        period=period,
+                        interval="1d",
                     )
-                    df = pd.DataFrame()
-
-                ok, cleaned, reason = validate_ohlcv(df)
+            except Exception as e:
+                last_error = str(e)
+                if is_rate_limit_error(e):
+                    st.session_state["rate_limited"] = True
+                    limiter.cooldown(YF_COOLDOWN_SECONDS)
                 log_fetch_event(
-                    "download_validate",
-                    {
-                        "ticker": cand,
-                        "plan": plan,
-                        "rows": len(df) if df is not None else 0,
-                        "columns": list(df.columns) if df is not None else [],
-                        "status": reason,
-                    },
+                    "download_error",
+                    {"ticker": cand, "error": last_error},
                     logs,
                 )
-                if ok:
-                    df = cleaned
-                    break
+                df = pd.DataFrame()
 
-            if not ok:
+            ok, cleaned, reason = validate_ohlcv(df)
+            log_fetch_event(
+                "download_validate",
+                {
+                    "ticker": cand,
+                    "rows": len(df) if df is not None else 0,
+                    "columns": list(df.columns) if df is not None else [],
+                    "status": reason,
+                },
+                logs,
+            )
+            if ok:
+                df = cleaned
+
+            if not ok and not st.session_state.get("rate_limited") and attempt == max_retries:
                 try:
                     limiter.wait()
                     history = yf.Ticker(cand, session=session).history(
-                        period="1y",
+                        period=period,
                         interval="1d",
                         auto_adjust=False,
                         actions=False,
@@ -500,7 +550,7 @@ def fetch_live_stock_uncached(ticker: str) -> Tuple[pd.DataFrame, Dict]:
                     )
                 except TypeError:
                     history = yf.Ticker(cand, session=session).history(
-                        period="1y",
+                        period=period,
                         interval="1d",
                         auto_adjust=False,
                         actions=False,
@@ -510,6 +560,7 @@ def fetch_live_stock_uncached(ticker: str) -> Tuple[pd.DataFrame, Dict]:
                     last_error = str(e)
                     if is_rate_limit_error(e):
                         st.session_state["rate_limited"] = True
+                        limiter.cooldown(YF_COOLDOWN_SECONDS)
                     history = pd.DataFrame()
                     log_fetch_event(
                         "history_error",
@@ -534,13 +585,13 @@ def fetch_live_stock_uncached(ticker: str) -> Tuple[pd.DataFrame, Dict]:
             if ok:
                 break
 
-            if attempt < max_retries:
-                delay = backoff_delay(attempt)
-                log_fetch_event("backoff", {"attempt": attempt, "sleep": round(delay, 2)}, logs)
-                time.sleep(delay)
+            if st.session_state.get("rate_limited"):
+                break
 
         if ok:
             ticker = cand
+            break
+        if st.session_state.get("rate_limited"):
             break
 
     if not ok:
@@ -633,7 +684,7 @@ def train_linear_regression_uncached(feat: pd.DataFrame, horizon: int) -> Dict:
     X = X.iloc[: len(y)]
 
     split = int(len(X) * 0.85)
-    scaler = MinMaxScaler()
+    scaler = new_scaler()
     Xtr = scaler.fit_transform(X.iloc[:split])
     ytr = y.iloc[:split]
     Xte = scaler.transform(X.iloc[split:])
@@ -660,7 +711,7 @@ def train_random_forest_uncached(feat: pd.DataFrame, horizon: int) -> Dict:
     X = X.iloc[: len(y)]
 
     split = int(len(X) * 0.85)
-    scaler = MinMaxScaler()
+    scaler = new_scaler()
     Xtr = scaler.fit_transform(X.iloc[:split])
     ytr = y.iloc[:split]
     Xte = scaler.transform(X.iloc[split:])
@@ -711,7 +762,7 @@ def train_lstm_uncached(df: pd.DataFrame, horizon: int, epochs: int, lightweight
     tf.keras.backend.clear_session()
 
     prices = df["Close"].values.astype(np.float32)
-    scaler = MinMaxScaler()
+    scaler = new_scaler()
     scaled = scaler.fit_transform(prices.reshape(-1, 1)).flatten()
 
     look_back = 20 if lightweight else 30
@@ -736,23 +787,8 @@ def train_lstm_uncached(df: pd.DataFrame, horizon: int, epochs: int, lightweight
     batch_size = 16 if lightweight else 32
     epochs = max(3, min(epochs, MAX_LSTM_EPOCHS))
 
-    Sequential = tf.keras.models.Sequential
-    LSTM = tf.keras.layers.LSTM
-    Dense = tf.keras.layers.Dense
-    Dropout = tf.keras.layers.Dropout
     EarlyStopping = tf.keras.callbacks.EarlyStopping
-
-    model = Sequential(
-        [
-            LSTM(units_1, return_sequences=True, input_shape=(look_back, 1)),
-            Dropout(0.2),
-            LSTM(units_2),
-            Dropout(0.2),
-            Dense(16, activation="relu"),
-            Dense(1),
-        ]
-    )
-    model.compile(optimizer="adam", loss="huber")
+    model = get_lstm_model_factory()(look_back, units_1, units_2)
 
     es = EarlyStopping(monitor="val_loss", patience=2, restore_best_weights=True, verbose=0)
     model.fit(
@@ -792,33 +828,22 @@ def run_bert_sentiment(articles: List[Dict]) -> Dict:
             "overall": "Neutral",
         }
 
-    try:
-        model = load_bert_pipeline()
-    except Exception:
-        return {
-            "articles": [],
-            "counts": {"positive": 0, "neutral": 1, "negative": 0},
-            "pct_pos": 0,
-            "pct_neu": 100,
-            "pct_neg": 0,
-            "score": 0.5,
-            "overall": "Neutral",
-        }
-    texts = [(a["title"] + ". " + a["desc"])[:512] for a in articles]
-
+    sia = load_bert_pipeline()
     scored = []
-    try:
-        batch_size = min(8, max(1, len(texts)))
-        outputs = model(texts, batch_size=batch_size, truncation=True)
-    except Exception:
-        outputs = [[{"label": "3 stars", "score": 0.5}] for _ in texts]
-
-    for art, out in zip(articles, outputs):
+    for art in articles:
+        text = (art.get("title", "") + ". " + art.get("desc", ""))[:512]
         try:
-            best = out[0]
-            stars = int(str(best["label"])[0])
-            sentiment = "positive" if stars >= 4 else ("neutral" if stars == 3 else "negative")
-            conf = round(float(best["score"]), 4)
+            if sia is not None:
+                compound = sia.polarity_scores(text)["compound"]
+                if compound >= 0.05:
+                    sentiment = "positive"
+                elif compound <= -0.05:
+                    sentiment = "negative"
+                else:
+                    sentiment = "neutral"
+                conf = round(min(1.0, abs(compound) + 0.5), 4)
+            else:
+                sentiment, conf = "neutral", 0.5
         except Exception:
             sentiment, conf = "neutral", 0.5
         scored.append({**art, "sentiment": sentiment, "confidence": conf})
@@ -927,12 +952,10 @@ def main() -> None:
 
     if "run_inputs" not in st.session_state:
         st.session_state["run_inputs"] = None
-    if "run_id" not in st.session_state:
-        st.session_state["run_id"] = None
-    if "last_run_id" not in st.session_state:
-        st.session_state["last_run_id"] = None
-    if "last_results" not in st.session_state:
-        st.session_state["last_results"] = None
+    if "run_key" not in st.session_state:
+        st.session_state["run_key"] = None
+    if "results_by_key" not in st.session_state:
+        st.session_state["results_by_key"] = {}
 
     with st.sidebar:
         st.markdown(
@@ -960,7 +983,7 @@ def main() -> None:
                 "Lightweight mode (cloud-safe)",
                 value=(LIGHTWEIGHT_ENV or is_cloud_env()),
             )
-            skip_lstm = st.toggle("Skip LSTM (faster)", value=False)
+            skip_lstm = st.toggle("Skip LSTM (faster)", value=is_cloud_env())
             use_cache = st.toggle("Use cache (faster)", value=True)
             debug_fetch = st.toggle("Debug fetch logs", value=DEBUG_FETCH_ENV)
             submit = st.form_submit_button("RUN →")
@@ -1003,7 +1026,7 @@ def main() -> None:
             "use_cache": use_cache,
         }
         st.session_state["debug_fetch"] = debug_fetch
-        st.session_state["run_id"] = time.time()
+        st.session_state["run_key"] = None
 
     inputs = st.session_state.get("run_inputs")
     if not inputs:
@@ -1030,12 +1053,10 @@ def main() -> None:
     effective_lightweight = inputs["lightweight"] or cloud_env
     effective_skip_lstm = inputs["skip_lstm"] or cloud_env
 
-    run_id = st.session_state.get("run_id")
-    cached_run = (
-        run_id is not None
-        and st.session_state.get("last_run_id") == run_id
-        and st.session_state.get("last_results") is not None
-    )
+    # Stable run key prevents rerun storms on widget changes.
+    run_key = make_run_key(ticker, inputs, effective_lightweight, effective_skip_lstm)
+    st.session_state["run_key"] = run_key
+    cached_run = inputs.get("use_cache", True) and run_key in st.session_state.get("results_by_key", {})
 
     states: Dict[int, str] = {}
     results: Dict[str, object] = {}
@@ -1045,7 +1066,7 @@ def main() -> None:
         render_pipeline(states, pipeline_ph)
 
     if cached_run:
-        results = st.session_state.get("last_results") or {}
+        results = st.session_state.get("results_by_key", {}).get(run_key, {})
         states = {idx: "done" for idx in range(len(STEPS))}
         render_pipeline(states, pipeline_ph)
         st.info("✅ Using cached run results (no recomputation).")
@@ -1072,11 +1093,13 @@ def main() -> None:
             if st.session_state.get("using_cached_data"):
                 st.warning("⚠️ Using cached market data due to temporary Yahoo Finance limits.")
             if st.session_state.get("rate_limited"):
-                st.warning("⏳ Yahoo Finance rate-limited requests. Added cooldown and backoff; try again later if needed.")
+                st.warning("⏳ Yahoo Finance rate-limited requests. Please wait 1–2 minutes and retry.")
         except Exception as e:
             tick(1, "error")
             if st.session_state.get("rate_limited"):
-                status_ph.error("❌ Yahoo Finance temporarily rate-limited requests. Please wait a minute and retry.")
+                status_ph.error(
+                    "Yahoo Finance temporarily rate-limited requests. Please wait 1–2 minutes and retry."
+                )
             else:
                 status_ph.error(f"❌ Stock data error: {e}")
             if st.session_state.get("debug_fetch") and st.session_state.get("fetch_logs"):
@@ -1141,7 +1164,7 @@ def main() -> None:
             tick(3, "done")
             results["sentiment"] = run_bert_sentiment([])
         else:
-            sent_ph.info(f"🤖 **Step 4** — Running BERT on {len(articles)} headlines…")
+            sent_ph.info(f"🤖 **Step 4** — Running VADER sentiment on {len(articles)} headlines…")
             t0 = time.time()
             try:
                 art_sig = articles_signature(articles)
@@ -1152,7 +1175,7 @@ def main() -> None:
                 results["sentiment"] = sent
                 tick(3, "done")
                 sent_ph.success(
-                    f"✅ **Step 4** — BERT done in {time.time()-t0:.1f}s  |  "
+                    f"✅ **Step 4** — VADER done in {time.time()-t0:.1f}s  |  "
                     f"Positive {sent['pct_pos']}%  Neutral {sent['pct_neu']}%  Negative {sent['pct_neg']}%  |  "
                     f"Overall: **{sent['overall']}**"
                 )
@@ -1283,7 +1306,7 @@ def main() -> None:
                     lstm_res = train_lstm_cached(
                         df,
                         inputs["horizon"],
-                        inputs["lstm_epochs"],
+                        min(inputs["lstm_epochs"], 4 if cloud_env else inputs["lstm_epochs"]),
                         effective_lightweight,
                         sig,
                     )
@@ -1291,7 +1314,7 @@ def main() -> None:
                     lstm_res = train_lstm_uncached(
                         df,
                         inputs["horizon"],
-                        inputs["lstm_epochs"],
+                        min(inputs["lstm_epochs"], 4 if cloud_env else inputs["lstm_epochs"]),
                         effective_lightweight,
                     )
                 results["lstm_res"] = lstm_res
@@ -1369,7 +1392,8 @@ def main() -> None:
     )
 
     with st.expander("📉 Historical Price (Last 1Y)", expanded=True):
-        price_view = df[["Close"]].tail(252)
+        chart_points = 126 if cloud_env else 252
+        price_view = df[["Close"]].tail(chart_points)
         st.line_chart(price_view, use_container_width=True, color="#1f6feb")
 
     st.divider()
@@ -1443,8 +1467,8 @@ def main() -> None:
                 "vol_label": vol_label,
             }
         )
-        st.session_state["last_results"] = results
-        st.session_state["last_run_id"] = run_id
+        if inputs.get("use_cache", True):
+            st.session_state.setdefault("results_by_key", {})[run_key] = results
 
 
 if __name__ == "__main__":
