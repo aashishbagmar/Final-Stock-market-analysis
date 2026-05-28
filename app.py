@@ -12,8 +12,6 @@ import logging
 import warnings
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
-from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
 
 # --- Third-party ---
 import numpy as np
@@ -29,21 +27,6 @@ from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error
-
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.callbacks import EarlyStopping
-
-try:
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline as hf_pipeline
-    _TRANSFORMERS_FULL = True
-except Exception:
-    from transformers import pipeline as hf_pipeline
-    AutoModelForSequenceClassification = None
-    AutoTokenizer = None
-    _TRANSFORMERS_FULL = False
-import torch
 
 try:
     from dotenv import load_dotenv
@@ -69,13 +52,18 @@ if load_dotenv:
 
 # --- Config ---
 DEFAULT_CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "900"))
+CACHE_TTL_STOCK = int(os.getenv("CACHE_TTL_STOCK", "300"))
+CACHE_TTL_NEWS = int(os.getenv("CACHE_TTL_NEWS", "600"))
+CACHE_TTL_FEATURES = int(os.getenv("CACHE_TTL_FEATURES", "3600"))
+CACHE_TTL_MODELS = int(os.getenv("CACHE_TTL_MODELS", "3600"))
+CACHE_TTL_SENTIMENT = int(os.getenv("CACHE_TTL_SENTIMENT", "3600"))
+CACHE_TTL_INFO = int(os.getenv("CACHE_TTL_INFO", "21600"))
 MAX_ARTICLES_DEFAULT = int(os.getenv("MAX_NEWS_ARTICLES", "12"))
 MAX_LSTM_EPOCHS = int(os.getenv("LSTM_MAX_EPOCHS", "10"))
-MODEL_WARMUP = os.getenv("MODEL_WARMUP", "true").lower() == "true"
 LIGHTWEIGHT_ENV = os.getenv("LIGHTWEIGHT_MODE", "").lower() in ("1", "true", "yes")
 DEBUG_FETCH_ENV = os.getenv("DEBUG_FETCH", "").lower() in ("1", "true", "yes")
 YF_MIN_INTERVAL = float(os.getenv("YF_MIN_INTERVAL", "1.2"))
-YF_MAX_RETRIES = int(os.getenv("YF_MAX_RETRIES", "3"))
+YF_MAX_RETRIES = int(os.getenv("YF_MAX_RETRIES", "2"))
 YF_TIMEOUT = int(os.getenv("YF_TIMEOUT", "10"))
 
 TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-^]{0,12}$")
@@ -187,6 +175,9 @@ def is_cloud_env() -> bool:
     )
 
 
+MODEL_WARMUP = os.getenv("MODEL_WARMUP", "true").lower() == "true" and not is_cloud_env()
+
+
 def get_secret(key: str) -> str:
     val = os.getenv(key)
     if val:
@@ -237,18 +228,16 @@ def build_ticker_candidates(ticker: str) -> List[str]:
 class RateLimiter:
     def __init__(self, min_interval: float) -> None:
         self.min_interval = min_interval
-        self._lock = Lock()
         self._last_call = 0.0
 
     def wait(self) -> float:
-        with self._lock:
-            now = time.monotonic()
-            elapsed = now - self._last_call
-            remaining = self.min_interval - elapsed
-            if remaining > 0:
-                time.sleep(remaining)
-            self._last_call = time.monotonic()
-            return max(0.0, remaining)
+        now = time.monotonic()
+        elapsed = now - self._last_call
+        remaining = self.min_interval - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+        self._last_call = time.monotonic()
+        return max(0.0, remaining)
 
 
 @st.cache_resource(show_spinner=False)
@@ -264,9 +253,26 @@ def is_rate_limit_error(err: Exception) -> bool:
 
 
 def backoff_delay(attempt: int) -> float:
-    base = 0.8 * (2 ** (attempt - 1))
+    base = 0.6 * (2 ** (attempt - 1))
     jitter = 0.2 * np.random.random()
-    return base + jitter
+    return min(3.2, base + jitter)
+
+
+def get_tf():
+    import tensorflow as tf
+
+    return tf
+
+
+def get_transformers():
+    try:
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline as hf_pipeline
+
+        return hf_pipeline, AutoModelForSequenceClassification, AutoTokenizer
+    except Exception:
+        from transformers import pipeline as hf_pipeline
+
+        return hf_pipeline, None, None
 
 
 def validate_ohlcv(df: pd.DataFrame, min_rows: int = 30) -> Tuple[bool, pd.DataFrame, str]:
@@ -289,13 +295,15 @@ def validate_ohlcv(df: pd.DataFrame, min_rows: int = 30) -> Tuple[bool, pd.DataF
 
 
 def log_fetch_event(event: str, details: Dict, logs: List[Dict]) -> None:
+    if not st.session_state.get("debug_fetch"):
+        return
     logger = logging.getLogger("stock_fetch")
     payload = {"event": event, **details}
     logger.info("stock_fetch %s", payload)
     logs.append(payload)
 
 
-@st.cache_data(ttl=DEFAULT_CACHE_TTL, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_INFO, show_spinner=False)
 def get_ticker_info_cached(ticker: str) -> Dict:
     session = get_yf_session()
     t = yf.Ticker(ticker, session=session)
@@ -338,12 +346,21 @@ def data_signature(df: pd.DataFrame) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def articles_signature(articles: List[Dict]) -> str:
+    if not articles:
+        return "empty"
+    payload = "|".join(
+        f"{a.get('title','')}|{a.get('date','')}|{a.get('source','')}" for a in articles
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 @st.cache_resource(show_spinner=False)
 def get_requests_session() -> requests.Session:
     session = requests.Session()
     retries = Retry(
-        total=2,
-        backoff_factor=0.4,
+        total=1,
+        backoff_factor=0.2,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
     )
@@ -363,13 +380,7 @@ def get_yf_session() -> requests.Session:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
     )
-    retries = Retry(
-        total=2,
-        backoff_factor=0.3,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
-    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
+    adapter = HTTPAdapter(max_retries=Retry(total=0), pool_connections=8, pool_maxsize=8)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
@@ -377,7 +388,10 @@ def get_yf_session() -> requests.Session:
 
 @st.cache_resource(show_spinner=False)
 def load_bert_pipeline():
-    if _TRANSFORMERS_FULL and AutoTokenizer and AutoModelForSequenceClassification:
+    hf_pipeline, AutoModelForSequenceClassification, AutoTokenizer = get_transformers()
+    if AutoTokenizer and AutoModelForSequenceClassification:
+        import torch
+
         tokenizer = AutoTokenizer.from_pretrained("nlptown/bert-base-multilingual-uncased-sentiment")
         model = AutoModelForSequenceClassification.from_pretrained(
             "nlptown/bert-base-multilingual-uncased-sentiment",
@@ -387,7 +401,6 @@ def load_bert_pipeline():
         torch.set_num_threads(1)
         return hf_pipeline("text-classification", model=model, tokenizer=tokenizer, device=-1, top_k=1)
 
-    # Fallback for older/partial transformers installs
     return hf_pipeline(
         "text-classification",
         model="nlptown/bert-base-multilingual-uncased-sentiment",
@@ -395,26 +408,21 @@ def load_bert_pipeline():
     )
 
 
-def warmup_models():
-    if not MODEL_WARMUP:
-        return
-    if st.session_state.get("warmup_started"):
-        return
-    st.session_state["warmup_started"] = True
-
-    executor = ThreadPoolExecutor(max_workers=1)
-    st.session_state["warmup_future"] = executor.submit(load_bert_pipeline)
+def warmup_models() -> None:
+    # Background warmups are disabled for Streamlit Cloud stability.
+    return
 
 
-@st.cache_data(ttl=DEFAULT_CACHE_TTL, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_STOCK, show_spinner=False)
 def fetch_live_stock_cached(ticker: str) -> Tuple[pd.DataFrame, Dict]:
     return fetch_live_stock_uncached(ticker)
 
 
 def fetch_live_stock_uncached(ticker: str) -> Tuple[pd.DataFrame, Dict]:
-    # Robust yfinance fetch with retries, fallbacks, and validation.
+    # Robust yfinance fetch with cooldown, limited retries, and validation.
     logs: List[Dict] = []
-    st.session_state["fetch_logs"] = logs
+    if st.session_state.get("debug_fetch"):
+        st.session_state["fetch_logs"] = logs
     st.session_state["using_cached_data"] = False
     st.session_state["rate_limited"] = False
 
@@ -427,10 +435,9 @@ def fetch_live_stock_uncached(ticker: str) -> Tuple[pd.DataFrame, Dict]:
     download_plans = [
         {"period": "2y", "interval": "1d"},
         {"period": "1y", "interval": "1d"},
-        {"period": "6mo", "interval": "1d"},
     ]
 
-    max_retries = max(2, min(YF_MAX_RETRIES, 3))
+    max_retries = max(1, min(YF_MAX_RETRIES, 2))
     timeout = YF_TIMEOUT
 
     ok = False
@@ -439,6 +446,7 @@ def fetch_live_stock_uncached(ticker: str) -> Tuple[pd.DataFrame, Dict]:
         for attempt in range(1, max_retries + 1):
             log_fetch_event("download_attempt", {"ticker": cand, "attempt": attempt}, logs)
 
+            df = pd.DataFrame()
             for plan in download_plans:
                 try:
                     limiter.wait()
@@ -479,56 +487,57 @@ def fetch_live_stock_uncached(ticker: str) -> Tuple[pd.DataFrame, Dict]:
                     df = cleaned
                     break
 
-            if ok:
-                break
+            if not ok:
+                try:
+                    limiter.wait()
+                    history = yf.Ticker(cand, session=session).history(
+                        period="1y",
+                        interval="1d",
+                        auto_adjust=False,
+                        actions=False,
+                        repair=True,
+                        timeout=timeout,
+                    )
+                except TypeError:
+                    history = yf.Ticker(cand, session=session).history(
+                        period="1y",
+                        interval="1d",
+                        auto_adjust=False,
+                        actions=False,
+                        repair=True,
+                    )
+                except Exception as e:
+                    last_error = str(e)
+                    if is_rate_limit_error(e):
+                        st.session_state["rate_limited"] = True
+                    history = pd.DataFrame()
+                    log_fetch_event(
+                        "history_error",
+                        {"ticker": cand, "error": last_error},
+                        logs,
+                    )
 
-            try:
-                limiter.wait()
-                history = yf.Ticker(cand, session=session).history(
-                    period="1y",
-                    interval="1d",
-                    auto_adjust=False,
-                    actions=False,
-                    repair=True,
-                    timeout=timeout,
-                )
-            except TypeError:
-                history = yf.Ticker(cand, session=session).history(
-                    period="1y",
-                    interval="1d",
-                    auto_adjust=False,
-                    actions=False,
-                    repair=True,
-                )
-            except Exception as e:
-                last_error = str(e)
-                if is_rate_limit_error(e):
-                    st.session_state["rate_limited"] = True
-                history = pd.DataFrame()
+                ok, cleaned, reason = validate_ohlcv(history)
                 log_fetch_event(
-                    "history_error",
-                    {"ticker": cand, "error": last_error},
+                    "history_validate",
+                    {
+                        "ticker": cand,
+                        "rows": len(history) if history is not None else 0,
+                        "columns": list(history.columns) if history is not None else [],
+                        "status": reason,
+                    },
                     logs,
                 )
+                if ok:
+                    df = cleaned
 
-            ok, cleaned, reason = validate_ohlcv(history)
-            log_fetch_event(
-                "history_validate",
-                {
-                    "ticker": cand,
-                    "rows": len(history) if history is not None else 0,
-                    "columns": list(history.columns) if history is not None else [],
-                    "status": reason,
-                },
-                logs,
-            )
             if ok:
-                df = cleaned
                 break
 
-            delay = backoff_delay(attempt)
-            log_fetch_event("backoff", {"attempt": attempt, "sleep": round(delay, 2)}, logs)
-            time.sleep(delay)
+            if attempt < max_retries:
+                delay = backoff_delay(attempt)
+                log_fetch_event("backoff", {"attempt": attempt, "sleep": round(delay, 2)}, logs)
+                time.sleep(delay)
 
         if ok:
             ticker = cand
@@ -548,7 +557,7 @@ def fetch_live_stock_uncached(ticker: str) -> Tuple[pd.DataFrame, Dict]:
     return df, info
 
 
-@st.cache_data(ttl=DEFAULT_CACHE_TTL, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_NEWS, show_spinner=False)
 def fetch_live_news_cached(query: str, api_key: str, n: int) -> List[Dict]:
     return fetch_live_news_uncached(query, api_key, n)
 
@@ -584,7 +593,11 @@ def fetch_live_news_uncached(query: str, api_key: str, n: int) -> List[Dict]:
     ]
 
 
-@st.cache_data(ttl=DEFAULT_CACHE_TTL, show_spinner=False)
+@st.cache_data(
+    ttl=CACHE_TTL_FEATURES,
+    show_spinner=False,
+    hash_funcs={pd.DataFrame: lambda df: data_signature(df)},
+)
 def engineer_features_cached(df: pd.DataFrame, sig: str) -> pd.DataFrame:
     return engineer_features_uncached(df)
 
@@ -605,7 +618,11 @@ def engineer_features_uncached(df: pd.DataFrame) -> pd.DataFrame:
     return d.dropna()
 
 
-@st.cache_data(ttl=DEFAULT_CACHE_TTL, show_spinner=False)
+@st.cache_data(
+    ttl=CACHE_TTL_MODELS,
+    show_spinner=False,
+    hash_funcs={pd.DataFrame: lambda df: data_signature(df)},
+)
 def train_linear_regression_cached(feat: pd.DataFrame, horizon: int, sig: str) -> Dict:
     return train_linear_regression_uncached(feat, horizon)
 
@@ -628,7 +645,11 @@ def train_linear_regression_uncached(feat: pd.DataFrame, horizon: int) -> Dict:
     return {"model": "Linear Regression", "predicted": round(pred, 2), "mae": mae}
 
 
-@st.cache_data(ttl=DEFAULT_CACHE_TTL, show_spinner=False)
+@st.cache_data(
+    ttl=CACHE_TTL_MODELS,
+    show_spinner=False,
+    hash_funcs={pd.DataFrame: lambda df: data_signature(df)},
+)
 def train_random_forest_cached(feat: pd.DataFrame, horizon: int, sig: str) -> Dict:
     return train_random_forest_uncached(feat, horizon)
 
@@ -645,8 +666,9 @@ def train_random_forest_uncached(feat: pd.DataFrame, horizon: int) -> Dict:
     Xte = scaler.transform(X.iloc[split:])
     yte = y.iloc[split:]
 
+    n_estimators = 80 if is_cloud_env() else 160
     model = RandomForestRegressor(
-        n_estimators=160,
+        n_estimators=n_estimators,
         max_depth=8,
         random_state=42,
         n_jobs=-1,
@@ -659,6 +681,7 @@ def train_random_forest_uncached(feat: pd.DataFrame, horizon: int) -> Dict:
 
 def configure_tensorflow(lightweight: bool) -> None:
     try:
+        tf = get_tf()
         tf.get_logger().setLevel("ERROR")
         if lightweight:
             tf.config.threading.set_intra_op_parallelism_threads(1)
@@ -667,7 +690,11 @@ def configure_tensorflow(lightweight: bool) -> None:
         pass
 
 
-@st.cache_data(ttl=DEFAULT_CACHE_TTL, show_spinner=False)
+@st.cache_data(
+    ttl=CACHE_TTL_MODELS,
+    show_spinner=False,
+    hash_funcs={pd.DataFrame: lambda df: data_signature(df)},
+)
 def train_lstm_cached(
     df: pd.DataFrame,
     horizon: int,
@@ -680,6 +707,7 @@ def train_lstm_cached(
 
 def train_lstm_uncached(df: pd.DataFrame, horizon: int, epochs: int, lightweight: bool) -> Dict:
     configure_tensorflow(lightweight)
+    tf = get_tf()
     tf.keras.backend.clear_session()
 
     prices = df["Close"].values.astype(np.float32)
@@ -707,6 +735,12 @@ def train_lstm_uncached(df: pd.DataFrame, horizon: int, epochs: int, lightweight
     units_2 = 16 if lightweight else 24
     batch_size = 16 if lightweight else 32
     epochs = max(3, min(epochs, MAX_LSTM_EPOCHS))
+
+    Sequential = tf.keras.models.Sequential
+    LSTM = tf.keras.layers.LSTM
+    Dense = tf.keras.layers.Dense
+    Dropout = tf.keras.layers.Dropout
+    EarlyStopping = tf.keras.callbacks.EarlyStopping
 
     model = Sequential(
         [
@@ -774,7 +808,8 @@ def run_bert_sentiment(articles: List[Dict]) -> Dict:
 
     scored = []
     try:
-        outputs = model(texts, batch_size=8, truncation=True)
+        batch_size = min(8, max(1, len(texts)))
+        outputs = model(texts, batch_size=batch_size, truncation=True)
     except Exception:
         outputs = [[{"label": "3 stars", "score": 0.5}] for _ in texts]
 
@@ -801,6 +836,11 @@ def run_bert_sentiment(articles: List[Dict]) -> Dict:
         "score": round(score, 4),
         "overall": "Positive" if score > 0.6 else ("Negative" if score < 0.4 else "Neutral"),
     }
+
+
+@st.cache_data(ttl=CACHE_TTL_SENTIMENT, show_spinner=False)
+def run_bert_sentiment_cached(articles: List[Dict], sig: str) -> Dict:
+    return run_bert_sentiment(articles)
 
 
 def ensemble(lr: Dict, rf: Dict, lstm: Dict, current: float) -> Dict:
@@ -887,6 +927,12 @@ def main() -> None:
 
     if "run_inputs" not in st.session_state:
         st.session_state["run_inputs"] = None
+    if "run_id" not in st.session_state:
+        st.session_state["run_id"] = None
+    if "last_run_id" not in st.session_state:
+        st.session_state["last_run_id"] = None
+    if "last_results" not in st.session_state:
+        st.session_state["last_results"] = None
 
     with st.sidebar:
         st.markdown(
@@ -957,6 +1003,7 @@ def main() -> None:
             "use_cache": use_cache,
         }
         st.session_state["debug_fetch"] = debug_fetch
+        st.session_state["run_id"] = time.time()
 
     inputs = st.session_state.get("run_inputs")
     if not inputs:
@@ -978,6 +1025,18 @@ def main() -> None:
         st.error("Please enter a valid ticker symbol (letters, numbers, dot, dash).")
         return
 
+    # Cloud mode overrides: skip LSTM, reduce history length, and enforce lightweight settings.
+    cloud_env = is_cloud_env()
+    effective_lightweight = inputs["lightweight"] or cloud_env
+    effective_skip_lstm = inputs["skip_lstm"] or cloud_env
+
+    run_id = st.session_state.get("run_id")
+    cached_run = (
+        run_id is not None
+        and st.session_state.get("last_run_id") == run_id
+        and st.session_state.get("last_results") is not None
+    )
+
     states: Dict[int, str] = {}
     results: Dict[str, object] = {}
 
@@ -985,41 +1044,49 @@ def main() -> None:
         states[idx] = status
         render_pipeline(states, pipeline_ph)
 
-    tick(0, "done")
+    if cached_run:
+        results = st.session_state.get("last_results") or {}
+        states = {idx: "done" for idx in range(len(STEPS))}
+        render_pipeline(states, pipeline_ph)
+        st.info("✅ Using cached run results (no recomputation).")
+    else:
+        tick(0, "done")
 
     # Step 2: Stock data
-    tick(1, "active")
-    status_ph = st.empty()
-    status_ph.info("📡 **Step 2** — Fetching live stock data…")
-    try:
-        if inputs["use_cache"]:
-            df, info = fetch_live_stock_cached(ticker)
-        else:
-            df, info = fetch_live_stock_uncached(ticker)
-        results["df"] = df
-        results["info"] = info
-        tick(1, "done")
-        status_ph.success(
-            f"✅ **{info['name']}** — {len(df)} trading days loaded "
-            f"({df.index[0].date()} → {df.index[-1].date()})"
-        )
-        if st.session_state.get("using_cached_data"):
-            st.warning("⚠️ Using cached market data due to temporary Yahoo Finance limits.")
-        if st.session_state.get("rate_limited"):
-            st.warning("⏳ Yahoo Finance rate-limited requests. Added cooldown and backoff; try again later if needed.")
-    except Exception as e:
-        tick(1, "error")
-        if st.session_state.get("rate_limited"):
-            status_ph.error("❌ Yahoo Finance temporarily rate-limited requests. Please wait a minute and retry.")
-        else:
-            status_ph.error(f"❌ Stock data error: {e}")
-        if st.session_state.get("debug_fetch") and st.session_state.get("fetch_logs"):
-            with st.expander("Stock Fetch Debug Logs", expanded=False):
-                st.json(st.session_state.get("fetch_logs"))
-        return
+    if not cached_run:
+        tick(1, "active")
+        status_ph = st.empty()
+        status_ph.info("📡 **Step 2** — Fetching live stock data…")
+        try:
+            if inputs["use_cache"]:
+                df, info = fetch_live_stock_cached(ticker)
+            else:
+                df, info = fetch_live_stock_uncached(ticker)
+            results["df"] = df
+            results["info"] = info
+            tick(1, "done")
+            status_ph.success(
+                f"✅ **{info['name']}** — {len(df)} trading days loaded "
+                f"({df.index[0].date()} → {df.index[-1].date()})"
+            )
+            if st.session_state.get("using_cached_data"):
+                st.warning("⚠️ Using cached market data due to temporary Yahoo Finance limits.")
+            if st.session_state.get("rate_limited"):
+                st.warning("⏳ Yahoo Finance rate-limited requests. Added cooldown and backoff; try again later if needed.")
+        except Exception as e:
+            tick(1, "error")
+            if st.session_state.get("rate_limited"):
+                status_ph.error("❌ Yahoo Finance temporarily rate-limited requests. Please wait a minute and retry.")
+            else:
+                status_ph.error(f"❌ Stock data error: {e}")
+            if st.session_state.get("debug_fetch") and st.session_state.get("fetch_logs"):
+                with st.expander("Stock Fetch Debug Logs", expanded=False):
+                    st.json(st.session_state.get("fetch_logs"))
+            return
 
     df = results["df"]
     info = results["info"]
+    articles = results.get("articles", [])
     cur = float(df["Close"].iloc[-1])
     currency = info["currency"]
     vol, vol_label = volatility(df)
@@ -1040,53 +1107,59 @@ def main() -> None:
     st.divider()
 
     # Step 3: News
-    tick(2, "active")
-    news_ph = st.empty()
-    if not news_api_key:
-        news_ph.warning("⚠️ **Step 3** — NEWS_API_KEY missing. Using neutral sentiment.")
-        tick(2, "done")
-        results["articles"] = []
-    else:
-        news_ph.info(f"📰 **Step 3** — Fetching latest {inputs['max_articles']} news articles…")
-        try:
-            query = info["name"] if info["name"] and info["name"] != ticker else ticker
-            if inputs["use_cache"]:
-                articles = fetch_live_news_cached(query, news_api_key, inputs["max_articles"])
-            else:
-                articles = fetch_live_news_uncached(query, news_api_key, inputs["max_articles"])
-            results["articles"] = articles
+    if not cached_run:
+        tick(2, "active")
+        news_ph = st.empty()
+        if not news_api_key:
+            news_ph.warning("⚠️ **Step 3** — NEWS_API_KEY missing. Using neutral sentiment.")
             tick(2, "done")
-            news_ph.success(f"✅ **Step 3** — {len(articles)} live articles fetched")
-        except Exception as e:
-            tick(2, "error")
-            news_ph.error(f"❌ News fetch error: {e}")
             results["articles"] = []
+        else:
+            news_ph.info(f"📰 **Step 3** — Fetching latest {inputs['max_articles']} news articles…")
+            try:
+                query = info["name"] if info["name"] and info["name"] != ticker else ticker
+                if inputs["use_cache"]:
+                    articles = fetch_live_news_cached(query, news_api_key, inputs["max_articles"])
+                else:
+                    articles = fetch_live_news_uncached(query, news_api_key, inputs["max_articles"])
+                results["articles"] = articles
+                tick(2, "done")
+                news_ph.success(f"✅ **Step 3** — {len(articles)} live articles fetched")
+            except Exception as e:
+                tick(2, "error")
+                news_ph.error(f"❌ News fetch error: {e}")
+                results["articles"] = []
 
     # Step 4: Sentiment
-    tick(3, "active")
-    sent_ph = st.empty()
-    articles = results["articles"]
+    if not cached_run:
+        tick(3, "active")
+        sent_ph = st.empty()
+        articles = results["articles"]
 
-    if not articles:
-        sent_ph.info("⚪ **Step 4** — No articles to classify. Using neutral sentiment.")
-        tick(3, "done")
-        results["sentiment"] = run_bert_sentiment([])
-    else:
-        sent_ph.info(f"🤖 **Step 4** — Running BERT on {len(articles)} headlines…")
-        t0 = time.time()
-        try:
-            sent = run_bert_sentiment(articles)
-            results["sentiment"] = sent
+        if not articles:
+            sent_ph.info("⚪ **Step 4** — No articles to classify. Using neutral sentiment.")
             tick(3, "done")
-            sent_ph.success(
-                f"✅ **Step 4** — BERT done in {time.time()-t0:.1f}s  |  "
-                f"Positive {sent['pct_pos']}%  Neutral {sent['pct_neu']}%  Negative {sent['pct_neg']}%  |  "
-                f"Overall: **{sent['overall']}**"
-            )
-        except Exception as e:
-            tick(3, "error")
-            sent_ph.error(f"❌ Sentiment error: {e}")
             results["sentiment"] = run_bert_sentiment([])
+        else:
+            sent_ph.info(f"🤖 **Step 4** — Running BERT on {len(articles)} headlines…")
+            t0 = time.time()
+            try:
+                art_sig = articles_signature(articles)
+                if inputs["use_cache"]:
+                    sent = run_bert_sentiment_cached(articles, art_sig)
+                else:
+                    sent = run_bert_sentiment(articles)
+                results["sentiment"] = sent
+                tick(3, "done")
+                sent_ph.success(
+                    f"✅ **Step 4** — BERT done in {time.time()-t0:.1f}s  |  "
+                    f"Positive {sent['pct_pos']}%  Neutral {sent['pct_neu']}%  Negative {sent['pct_neg']}%  |  "
+                    f"Overall: **{sent['overall']}**"
+                )
+            except Exception as e:
+                tick(3, "error")
+                sent_ph.error(f"❌ Sentiment error: {e}")
+                results["sentiment"] = run_bert_sentiment([])
 
     sent = results["sentiment"]
     with st.expander("📰 Sentiment Detail", expanded=False):
@@ -1124,110 +1197,132 @@ def main() -> None:
     st.markdown(f"### 📈 Model Training & Prediction  (horizon: +{inputs['horizon']} days)")
 
     # Step 5: Features
-    tick(4, "active")
-    feat_ph = st.empty()
-    feat_ph.info("🔧 **Step 5** — Engineering features…")
-    sig = data_signature(df)
-    try:
-        if inputs["use_cache"]:
-            feat = engineer_features_cached(df, sig)
-        else:
-            feat = engineer_features_uncached(df)
-        tick(4, "done")
-        feat_ph.success(f"✅ **Step 5** — Features ready: {list(feat.columns)} ({len(feat)} rows)")
-    except Exception as e:
-        tick(4, "error")
-        feat_ph.error(f"❌ Feature engineering error: {e}")
-        return
-
-    # Step 6: Linear Regression
-    tick(5, "active")
-    lr_ph = st.empty()
-    lr_ph.info("📐 **Step 6** — Training Linear Regression…")
-    t0 = time.time()
-    try:
-        if inputs["use_cache"]:
-            lr_res = train_linear_regression_cached(feat, inputs["horizon"], sig)
-        else:
-            lr_res = train_linear_regression_uncached(feat, inputs["horizon"])
-        tick(5, "done")
-        lr_ph.success(
-            f"✅ **Step 6** — Linear Regression in {time.time()-t0:.1f}s  |  "
-            f"Predicted price: **{fmt(lr_res['predicted'], currency)}**  |  MAE: {lr_res['mae']}"
-        )
-    except Exception as e:
-        tick(5, "error")
-        lr_ph.error(f"❌ Linear Regression error: {e}")
-        return
-
-    # Step 7: Random Forest
-    tick(6, "active")
-    rf_ph = st.empty()
-    rf_ph.info("🌲 **Step 7** — Training Random Forest…")
-    t0 = time.time()
-    try:
-        if inputs["use_cache"]:
-            rf_res = train_random_forest_cached(feat, inputs["horizon"], sig)
-        else:
-            rf_res = train_random_forest_uncached(feat, inputs["horizon"])
-        tick(6, "done")
-        rf_ph.success(
-            f"✅ **Step 7** — Random Forest in {time.time()-t0:.1f}s  |  "
-            f"Predicted price: **{fmt(rf_res['predicted'], currency)}**  |  MAE: {rf_res['mae']}"
-        )
-    except Exception as e:
-        tick(6, "error")
-        rf_ph.error(f"❌ Random Forest error: {e}")
-        return
-
-    # Step 8: LSTM
-    if inputs["skip_lstm"]:
-        tick(7, "done")
-        lstm_res = {"model": "LSTM (skipped)", "predicted": rf_res["predicted"], "mae": rf_res["mae"]}
-        st.info("⏩ **Step 8** — LSTM skipped (toggle off in sidebar).")
-    else:
-        tick(7, "active")
-        lstm_ph = st.empty()
-        lstm_ph.info("🧠 **Step 8** — Training LSTM…")
-        t0 = time.time()
+    if not cached_run:
+        tick(4, "active")
+        feat_ph = st.empty()
+        feat_ph.info("🔧 **Step 5** — Engineering features…")
+        sig = data_signature(df)
         try:
             if inputs["use_cache"]:
-                lstm_res = train_lstm_cached(
-                    df,
-                    inputs["horizon"],
-                    inputs["lstm_epochs"],
-                    inputs["lightweight"],
-                    sig,
-                )
+                feat = engineer_features_cached(df, sig)
             else:
-                lstm_res = train_lstm_uncached(
-                    df,
-                    inputs["horizon"],
-                    inputs["lstm_epochs"],
-                    inputs["lightweight"],
-                )
-            tick(7, "done")
-            lstm_ph.success(
-                f"✅ **Step 8** — LSTM in {time.time()-t0:.1f}s  |  "
-                f"Predicted price: **{fmt(lstm_res['predicted'], currency)}**  |  MAE: {lstm_res['mae']}"
+                feat = engineer_features_uncached(df)
+            results["feat"] = feat
+            results["sig"] = sig
+            tick(4, "done")
+            feat_ph.success(f"✅ **Step 5** — Features ready: {list(feat.columns)} ({len(feat)} rows)")
+        except Exception as e:
+            tick(4, "error")
+            feat_ph.error(f"❌ Feature engineering error: {e}")
+            return
+
+    # Step 6: Linear Regression
+    if not cached_run:
+        tick(5, "active")
+        lr_ph = st.empty()
+        lr_ph.info("📐 **Step 6** — Training Linear Regression…")
+        t0 = time.time()
+        feat = results.get("feat")
+        sig = results.get("sig")
+        try:
+            if inputs["use_cache"]:
+                lr_res = train_linear_regression_cached(feat, inputs["horizon"], sig)
+            else:
+                lr_res = train_linear_regression_uncached(feat, inputs["horizon"])
+            results["lr_res"] = lr_res
+            tick(5, "done")
+            lr_ph.success(
+                f"✅ **Step 6** — Linear Regression in {time.time()-t0:.1f}s  |  "
+                f"Predicted price: **{fmt(lr_res['predicted'], currency)}**  |  MAE: {lr_res['mae']}"
             )
         except Exception as e:
-            tick(7, "error")
-            lstm_ph.error(f"❌ LSTM error: {e}  |  Falling back to Random Forest.")
-            lstm_res = {"model": "LSTM (fallback)", "predicted": rf_res["predicted"], "mae": rf_res["mae"]}
+            tick(5, "error")
+            lr_ph.error(f"❌ Linear Regression error: {e}")
+            return
+
+    # Step 7: Random Forest
+    if not cached_run:
+        tick(6, "active")
+        rf_ph = st.empty()
+        rf_ph.info("🌲 **Step 7** — Training Random Forest…")
+        t0 = time.time()
+        feat = results.get("feat")
+        sig = results.get("sig")
+        try:
+            if inputs["use_cache"]:
+                rf_res = train_random_forest_cached(feat, inputs["horizon"], sig)
+            else:
+                rf_res = train_random_forest_uncached(feat, inputs["horizon"])
+            results["rf_res"] = rf_res
+            tick(6, "done")
+            rf_ph.success(
+                f"✅ **Step 7** — Random Forest in {time.time()-t0:.1f}s  |  "
+                f"Predicted price: **{fmt(rf_res['predicted'], currency)}**  |  MAE: {rf_res['mae']}"
+            )
+        except Exception as e:
+            tick(6, "error")
+            rf_ph.error(f"❌ Random Forest error: {e}")
+            return
+
+    # Step 8: LSTM
+    if not cached_run:
+        rf_res = results.get("rf_res")
+        if effective_skip_lstm:
+            tick(7, "done")
+            lstm_res = {"model": "LSTM (skipped)", "predicted": rf_res["predicted"], "mae": rf_res["mae"]}
+            results["lstm_res"] = lstm_res
+            st.info("⏩ **Step 8** — LSTM skipped (toggle off in sidebar).")
+        else:
+            tick(7, "active")
+            lstm_ph = st.empty()
+            lstm_ph.info("🧠 **Step 8** — Training LSTM…")
+            t0 = time.time()
+            sig = results.get("sig")
+            try:
+                if inputs["use_cache"]:
+                    lstm_res = train_lstm_cached(
+                        df,
+                        inputs["horizon"],
+                        inputs["lstm_epochs"],
+                        effective_lightweight,
+                        sig,
+                    )
+                else:
+                    lstm_res = train_lstm_uncached(
+                        df,
+                        inputs["horizon"],
+                        inputs["lstm_epochs"],
+                        effective_lightweight,
+                    )
+                results["lstm_res"] = lstm_res
+                tick(7, "done")
+                lstm_ph.success(
+                    f"✅ **Step 8** — LSTM in {time.time()-t0:.1f}s  |  "
+                    f"Predicted price: **{fmt(lstm_res['predicted'], currency)}**  |  MAE: {lstm_res['mae']}"
+                )
+            except Exception as e:
+                tick(7, "error")
+                lstm_ph.error(f"❌ LSTM error: {e}  |  Falling back to Random Forest.")
+                lstm_res = {"model": "LSTM (fallback)", "predicted": rf_res["predicted"], "mae": rf_res["mae"]}
+                results["lstm_res"] = lstm_res
 
     st.divider()
 
     # Step 9: Ensemble
-    tick(8, "active")
-    ens_ph = st.empty()
-    ens_ph.info("⚗️ **Step 9** — Computing MAE-weighted ensemble…")
-    ens = ensemble(lr_res, rf_res, lstm_res, cur)
-    tick(8, "done")
-    ens_ph.success(
-        f"✅ **Step 9** — Ensemble prediction: **{fmt(ens['final'], currency)}**  |  "
-        f"Change: {ens['pct_change']:+.2f}%  |  Confidence: {ens['confidence']}%"
-    )
+    if not cached_run:
+        tick(8, "active")
+        ens_ph = st.empty()
+        ens_ph.info("⚗️ **Step 9** — Computing MAE-weighted ensemble…")
+        lr_res = results.get("lr_res")
+        rf_res = results.get("rf_res")
+        lstm_res = results.get("lstm_res")
+        ens = ensemble(lr_res, rf_res, lstm_res, cur)
+        results["ens"] = ens
+        tick(8, "done")
+        ens_ph.success(
+            f"✅ **Step 9** — Ensemble prediction: **{fmt(ens['final'], currency)}**  |  "
+            f"Change: {ens['pct_change']:+.2f}%  |  Confidence: {ens['confidence']}%"
+        )
 
     st.markdown("#### Model Comparison")
     st.markdown(
@@ -1280,13 +1375,23 @@ def main() -> None:
     st.divider()
 
     # Step 10: Signal
-    tick(9, "active")
-    sig_ph = st.empty()
-    sig_ph.info("🤖 **Step 10** — Generating final signal…")
-    decision = make_signal(ens, sent)
-    sig = decision["signal"]
-    tick(9, "done")
-    sig_ph.success(f"✅ **Step 10** — Signal: **{sig}**")
+    if not cached_run:
+        tick(9, "active")
+        sig_ph = st.empty()
+        sig_ph.info("🤖 **Step 10** — Generating final signal…")
+        decision = make_signal(ens, sent)
+        sig = decision["signal"]
+        results["decision"] = decision
+        tick(9, "done")
+        sig_ph.success(f"✅ **Step 10** — Signal: **{sig}**")
+    else:
+        decision = results.get("decision")
+        ens = results.get("ens")
+        lr_res = results.get("lr_res")
+        rf_res = results.get("rf_res")
+        lstm_res = results.get("lstm_res")
+        sent = results.get("sentiment")
+        sig = decision["signal"]
 
     st.markdown("### 🎯 Final AI Signal")
     st.markdown(
@@ -1322,12 +1427,24 @@ def main() -> None:
 
     cloud_state = "Cloud" if is_cloud_env() else "Local"
     st.caption(
-        f"Runtime: {cloud_state} | Cache TTL: {DEFAULT_CACHE_TTL}s | Lightweight: {inputs['lightweight']}"
+        f"Runtime: {cloud_state} | Cache TTL: {DEFAULT_CACHE_TTL}s | Lightweight: {effective_lightweight}"
     )
     st.caption(
         "⚠️ **Disclaimer**: Educational / research use only. Not financial advice. "
         "Past performance does not guarantee future results."
     )
+
+    if not cached_run:
+        results.update(
+            {
+                "cur": cur,
+                "currency": currency,
+                "vol": vol,
+                "vol_label": vol_label,
+            }
+        )
+        st.session_state["last_results"] = results
+        st.session_state["last_run_id"] = run_id
 
 
 if __name__ == "__main__":
