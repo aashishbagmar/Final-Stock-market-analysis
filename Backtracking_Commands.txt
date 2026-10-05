@@ -1,0 +1,3 @@
+python Backtracking/backtest.py F 5 8
+
+python Backtracking/backtest.py "TCS.NS" 5 8
